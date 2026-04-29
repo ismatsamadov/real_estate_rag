@@ -89,6 +89,23 @@ npm run start
 
 Then open `http://localhost:8787`.
 
+## UI walkthrough
+
+### Ask a question
+The query panel supports free-text prompts and a `Top K` slider to control retrieval depth.
+
+![Ask a question view](screenshots/Ask%20a%20question.png)
+
+### Answer panel
+Answers are rendered in a readable format and include inline citation markers (for example, `[S1]`, `[S2]`) tied to retrieved chunks.
+
+![Answer panel view](screenshots/Answer.png)
+
+### Traceable Sources
+Each source card shows similarity score, URL, `doc_id`, chunk index, metadata tags, and a snippet so responses can be audited.
+
+![Traceable sources view](screenshots/Traceable%20Sources.png)
+
 ## API reference
 
 ### `GET /api/health`

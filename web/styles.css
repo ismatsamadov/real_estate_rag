@@ -216,7 +216,7 @@ h2 {
   border-radius: 12px;
   padding: 0.8rem;
   background: rgba(2, 6, 23, 0.46);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .source-head {
@@ -247,6 +247,58 @@ h2 {
   padding: 0.12rem 0.5rem;
   font-size: 0.77rem;
   white-space: nowrap;
+}
+
+.score-badge {
+  gap: 0.35rem;
+}
+
+.score-help {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.05rem;
+  height: 1.05rem;
+  border-radius: 999px;
+  border: 1px solid rgba(34, 211, 238, 0.45);
+  color: #a5f3fc;
+  background: rgba(2, 6, 23, 0.45);
+  font-size: 0.68rem;
+  font-weight: 700;
+  cursor: help;
+  outline: none;
+}
+
+.score-help:focus-visible {
+  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.45);
+}
+
+.score-tooltip {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  top: calc(100% + 0.45rem);
+  transform: translateX(-50%);
+  width: min(290px, 70vw);
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.97);
+  color: var(--text);
+  font-size: 0.74rem;
+  line-height: 1.4;
+  white-space: normal;
+  box-shadow: 0 10px 24px rgba(2, 6, 23, 0.45);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.score-help:hover .score-tooltip,
+.score-help:focus-visible .score-tooltip {
+  opacity: 1;
+  visibility: visible;
 }
 
 .badge-muted {

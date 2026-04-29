@@ -90,6 +90,19 @@ function prettyTag(value, fallback = "unknown") {
   return clean.length <= 22 ? clean : `${clean.slice(0, 22)}...`;
 }
 
+function scoreBand(score) {
+  const value = Number(score) || 0;
+  if (value >= 0.4) return "strong";
+  if (value >= 0.25) return "moderate";
+  if (value >= 0.1) return "weak";
+  return "very weak";
+}
+
+function scoreTooltip(score) {
+  const band = scoreBand(score);
+  return `Cosine similarity (1 - cosine distance). Higher is more relevant. This score is ${band} and should be read relative to other sources in this same answer.`;
+}
+
 function formatInline(text) {
   return escapeHtml(text)
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
@@ -186,6 +199,7 @@ function renderSources(sources) {
       const domain = sourceDomain(sourceUrl);
       const pagePath = sourcePath(sourceUrl);
       const scoreValue = (Number(s.score) || 0).toFixed(4);
+      const scoreInfo = scoreTooltip(s.score);
       const sid = String(s.sid || "S?");
       const urlLabel = truncateMiddle(sourceUrl, 74);
 
@@ -193,7 +207,13 @@ function renderSources(sources) {
       <article class="source-card">
         <div class="source-head">
           <span class="sid">${escapeHtml(sid)}</span>
-          <span class="badge">score ${scoreValue}</span>
+          <span class="badge score-badge">
+            score ${scoreValue}
+            <span class="score-help" tabindex="0" role="note" aria-label="How score works">
+              i
+              <span class="score-tooltip" role="tooltip">${escapeHtml(scoreInfo)}</span>
+            </span>
+          </span>
         </div>
         <h3 class="source-title">${escapeHtml(title)}</h3>
         <div class="source-meta-row">

@@ -65,11 +65,13 @@ function sourcePath(url) {
   }
 }
 
-function compactDocId(docId) {
+function compactDocId(docId, max = 30) {
   const clean = String(docId || "").trim();
   if (!clean) return "n/a";
-  if (clean.length <= 46) return clean;
-  return `${clean.slice(0, 20)}...${clean.slice(-16)}`;
+  if (clean.length <= max) return clean;
+  const tail = Math.max(8, Math.floor((max - 3) / 2));
+  const head = Math.max(8, max - 3 - tail);
+  return `${clean.slice(0, head)}...${clean.slice(-tail)}`;
 }
 
 function truncateMiddle(text, max = 72) {
@@ -202,6 +204,8 @@ function renderSources(sources) {
       const scoreInfo = scoreTooltip(s.score);
       const sid = String(s.sid || "S?");
       const urlLabel = truncateMiddle(sourceUrl, 74);
+      const compactedDocId = compactDocId(docId, 30);
+      const hasFullDocIdReveal = docId && compactedDocId !== docId;
 
       return `
       <article class="source-card">
@@ -222,9 +226,14 @@ function renderSources(sources) {
           ${domain ? `<span class="badge badge-muted">${escapeHtml(domain)}</span>` : ""}
         </div>
         <div class="source-meta-row">
-          <span class="badge badge-muted" title="${escapeHtml(docId)}">doc ${escapeHtml(compactDocId(docId))}</span>
+          <span class="badge badge-muted doc-badge" title="${escapeHtml(docId)}">doc ${escapeHtml(compactedDocId)}</span>
           <span class="badge badge-muted">chunk ${escapeHtml(chunkIndex)}</span>
         </div>
+        ${
+          hasFullDocIdReveal
+            ? `<details class="doc-id-details"><summary>show full doc id</summary><code>${escapeHtml(docId)}</code></details>`
+            : ""
+        }
         <div class="score-track" role="presentation">
           <span class="score-bar" style="width:${Math.max(0, Math.min(100, Number(s.score) * 100)).toFixed(1)}%"></span>
         </div>

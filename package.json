@@ -1,0 +1,22 @@
+{
+  "name": "rag-export",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Extract sitemap URLs and export Firecrawl markdown as RAG-ready JSONL",
+  "main": "app/server.js",
+  "scripts": {
+    "build-rag": "node scripts/build-rag.js",
+    "ingest-pgvector": "node scripts/ingest-pgvector.js",
+    "ask-rag": "node scripts/ask-rag.js",
+    "start": "node app/server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.54.0",
+    "@mendable/firecrawl-js": "^1.28.0",
+    "@xenova/transformers": "^2.0.1",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2",
+    "fast-xml-parser": "^5.7.2",
+    "pg": "^8.16.3"
+  }
+}

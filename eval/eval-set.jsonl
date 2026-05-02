@@ -1,0 +1,10 @@
+{"question": "What is Mardi Mekan Estate?", "must_match": ["mardi mekan"], "category": "project_lookup"}
+{"question": "Which projects offer townhouses?", "must_match": ["townhouse"], "category": "filter"}
+{"question": "Tell me about The Crescent Residences.", "must_match": ["crescent"], "category": "project_lookup"}
+{"question": "What is the Ritz Carlton Residences offering?", "must_match": ["ritz", "carlton"], "category": "project_lookup"}
+{"question": "Are there apartments at the St. Regis Baku Residences?", "must_match": ["st. regis", "st regis", "regis"], "category": "project_lookup"}
+{"question": "What property types are available at Knightsbridge Residences?", "must_match": ["knightsbridge"], "category": "project_lookup"}
+{"question": "Where is Mardi Mekan Estate located?", "must_match": ["mardi mekan"], "category": "location"}
+{"question": "Which projects are currently available for sale?", "must_match": ["available for sale", "for sale"], "category": "availability"}
+{"question": "What is Pasha Real Estate's portfolio?", "must_match": ["portfolio"], "category": "general"}
+{"question": "How can I contact Pasha Real Estate?", "must_match": ["contact"], "category": "general"}

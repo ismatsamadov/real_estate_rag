@@ -10,36 +10,86 @@ of the pipeline — scraping, chunking, embedding, retrieval, generation,
 serving — is split into a focused module that's easy to reason about,
 test, and extend.
 
-```text
-┌──────────┐   ┌──────────────┐   ┌────────────────┐   ┌──────────────┐
-│ Sitemap  │──▶│  Firecrawl   │──▶│  JSONL corpus  │──▶│  Chunker +   │
-│ (XML)    │   │   scraper    │   │ (data/*.jsonl) │   │  Embedder    │
-└──────────┘   └──────────────┘   └────────────────┘   └──────┬───────┘
-                                                              │
-                                                              ▼
-   ┌──────────────────────────────────────────────────────────────┐
-   │  Postgres + pgvector                                          │
-   │  ─────────────────────                                        │
-   │  rag_chunks(id, doc_id, url, chunk_index, content,            │
-   │             content_hash, metadata, embedding vector(384),    │
-   │             tsv tsvector GENERATED, ...)                      │
-   │                                                               │
-   │  HNSW(embedding vector_cosine_ops)   GIN(tsv)                 │
-   └──────────────────────────────────────────────────────────────┘
-                            │
-            ┌───────────────┴────────────────┐
-            ▼                                ▼
-   vector kNN (cosine)              tsvector ts_rank_cd
-            │                                │
-            └────────────┬───────────────────┘
-                         ▼
-              Reciprocal Rank Fusion
-                         │
-                         ▼
-            top-K chunks  ──▶  Anthropic Claude (streaming)
-                                         │
-                                         ▼
-                              grounded answer + [Sn] citations
+### Offline: scrape and ingest
+
+```mermaid
+flowchart LR
+    SM["pasharealestate.az<br/>sitemap.xml"] --> SCR
+
+    subgraph SCR["scripts/scrape.js"]
+        direction TB
+        S1["XMLParser<br/>(handles sitemap-index nesting)"]
+        S2["Firecrawl scrapeUrl<br/>concurrency=4 · retry×3 · backoff"]
+        S3["atomic rename<br/>(.tmp → final)"]
+        S1 --> S2 --> S3
+    end
+
+    SCR --> JSONL[("data/corpus.jsonl<br/>{id, url, text, metadata}")]
+
+    JSONL --> ING
+
+    subgraph ING["scripts/ingest.js"]
+        direction TB
+        I1["chunker.js<br/>headings → paragraphs → sentences<br/>maxChars=1200 · overlap=180"]
+        I2["SHA-256 content_hash<br/>skip unchanged · prune stale"]
+        I3["embedder.js<br/>Xenova all-MiniLM-L6-v2<br/>mean-pool + L2-norm → 384-d"]
+        I4["pg upsert<br/>ON CONFLICT (doc_id, chunk_index)<br/>batch=32"]
+        I5["ANALYZE rag_chunks"]
+        I1 --> I2 --> I3 --> I4 --> I5
+    end
+
+    ING --> DB[("Postgres + pgvector<br/>rag_chunks<br/>HNSW(embedding cosine, m=16)<br/>GIN(tsv) · btree(doc_id)")]
+```
+
+### Online: query, retrieve, generate
+
+```mermaid
+flowchart TD
+    U["Browser · web/app.js"] -->|"POST /api/ask/stream"| SRV
+
+    subgraph SRV["src/server.js"]
+        direction TB
+        M1["helmet (CSP)"]
+        M2["compression"]
+        M3["express-rate-limit<br/>per-IP on /api/ask*"]
+        M4["zod request body"]
+        M1 --> M2 --> M3 --> M4
+    end
+
+    SRV --> RAG["src/rag.js · askStream"]
+    RAG --> EMB["src/embedder.js<br/>embed(question) → 384-d"]
+
+    subgraph RET["src/retriever.js · single SQL CTE"]
+        direction TB
+        VH["vector_hits<br/>ORDER BY embedding &lt;=&gt; q::vector<br/>LIMIT candidate_k=24"]
+        LH["lexical_hits<br/>tsv @@ plainto_tsquery('english', q)<br/>ORDER BY ts_rank_cd DESC · LIMIT 24"]
+        RRF["RRF fusion<br/>SUM(1.0 / (60 + rank))<br/>ORDER BY rrf_score DESC · LIMIT top_k=8"]
+        VH --> RRF
+        LH --> RRF
+    end
+
+    EMB --> VH
+    RAG --> LH
+    DB[("rag_chunks")] -.-> VH
+    DB -.-> LH
+
+    RET --> SRC["top-K source chunks<br/>tagged S1..Sn"]
+    SRC --> PR
+
+    subgraph PR["src/prompt.js"]
+        direction TB
+        P1["system block<br/>citation contract<br/>cache_control: ephemeral"]
+        P2["user block<br/>question + Sn-tagged sources"]
+    end
+
+    PR --> LLM["src/llm.js · messages.stream<br/>claude-sonnet-4-5<br/>fallback: claude-haiku-4-5-20251001"]
+
+    LLM -->|"event: sources"| SSE
+    LLM -->|"event: model"| SSE
+    LLM -->|"event: delta × N"| SSE
+    LLM -->|"event: usage + done"| SSE
+    SSE["SSE response<br/>15s heartbeat · client-abort safe"] --> U
+    U -.->|"click [Sn]"| FOCUS["scroll + flash<br/>matching source card"]
 ```
 
 ## What's interesting (for AI engineers)

@@ -33,7 +33,51 @@ const REWRITE_SYSTEM = [
   "- Resolve pronouns and references (\"this one\", \"the other\", \"its price\") to the specific entity from the conversation.",
   "- If the follow-up is already standalone, output it unchanged.",
   "- Keep it short — search queries do not need full sentences.",
+  "",
+  "ROOM-TERMINOLOGY conversion at retrieval time (corpus stores bedrooms only):",
+  "- \"X otaqlı\" (AZ) / \"X-комнатная\" (RU) WITHOUT \"yataq\"/\"спальня\" means X total rooms.",
+  "  Convert to \"(X-1)-bedroom\" in the rewritten query so retrieval pulls the right listings.",
+  "  Examples:",
+  "    \"3 otaqlı mənzil\"         → \"2-bedroom apartment\"",
+  "    \"4-комнатная квартира\"   → \"3-bedroom apartment\"",
+  "    \"2 otaqlı ev\"             → \"1-bedroom home\"",
+  "- \"X yataq otaqlı\" / \"X спальня\" / \"X-bedroom\" stays as X bedrooms (no conversion).",
+  "- Do NOT apply this conversion in the user-facing answer — only in the retrieval query.",
 ].join("\n");
+
+/**
+ * Mechanical preprocessor for the post-Soviet "rooms = bedrooms + 1" idiom.
+ *
+ *   "3 otaqlı"     → "2-bedroom" (preserves the rest of the query)
+ *   "4-комнатная"  → "3-bedroom"
+ *
+ * Negative lookbehind protects "yataq otaqlı" / "спальня" — those are
+ * explicit bedroom counts and must not be converted. Runs unconditionally
+ * (no LLM call) so first-turn questions get the right retrieval target.
+ */
+const OTAQLI_RE = /(?<!yataq\s)(\b\d+)\s*[-\s]?\s*otaq(?:lı|li)?\b/gi;
+const KOMNATNAYA_RE = /(?<!спальня\s)(\b\d+)\s*[-\s]?\s*комнатн(?:ая|ой|ую|ые|ых)?\b/gi;
+
+function preprocessRoomTerminology(text) {
+  if (!text) return text;
+  let out = String(text);
+  let changed = false;
+  out = out.replace(OTAQLI_RE, (_m, n) => {
+    const total = parseInt(n, 10);
+    if (!Number.isFinite(total) || total < 1) return _m;
+    const bedrooms = Math.max(0, total - 1);
+    changed = true;
+    return `${bedrooms}-bedroom`;
+  });
+  out = out.replace(KOMNATNAYA_RE, (_m, n) => {
+    const total = parseInt(n, 10);
+    if (!Number.isFinite(total) || total < 1) return _m;
+    const bedrooms = Math.max(0, total - 1);
+    changed = true;
+    return `${bedrooms}-bedroom`;
+  });
+  return { rewritten: out, changed };
+}
 
 async function rewriteForRetrieval(question, history) {
   if (!Array.isArray(history) || history.length === 0) return question;
@@ -88,8 +132,11 @@ async function ask(question, options = {}) {
   const t0 = Date.now();
 
   let retrievalQuery = q;
+  // Same room-terminology preprocessor as askStream.
+  const pre = preprocessRoomTerminology(q);
+  if (pre && pre.changed) retrievalQuery = pre.rewritten;
   if (Array.isArray(options.history) && options.history.length > 0) {
-    retrievalQuery = await rewriteForRetrieval(q, options.history);
+    retrievalQuery = await rewriteForRetrieval(retrievalQuery, options.history);
   }
 
   const { sources, mode, reranked, fallback, cached } = await retrieve(retrievalQuery, options);
@@ -146,19 +193,26 @@ async function* askStream(question, options = {}) {
   }
   const t0 = Date.now();
 
-  // Rewrite the question into a standalone form before retrieval (only if
-  // there's prior history). Pronouns like "the other one" get resolved so
-  // retrieval pulls the correct entity's chunks. The LLM still answers the
-  // ORIGINAL question — rewriting is a retrieval-side concern only.
+  // RETRIEVAL-SIDE PREPROCESSING (the LLM still answers the ORIGINAL `q`):
+  //   1. Mechanical: convert AZ/RU "X otaqlı / X-комнатная" → "(X-1)-bedroom"
+  //      so retrieval pulls listings indexed by bedroom count. Runs always.
+  //   2. LLM-based standalone-question rewrite for follow-ups (resolves
+  //      pronouns like "the other one" using conversation history).
   let retrievalQuery = q;
+  const pre = preprocessRoomTerminology(q);
+  if (pre && pre.changed) {
+    retrievalQuery = pre.rewritten;
+    yield { type: "rewritten", original: q, rewritten: retrievalQuery, kind: "room-terminology" };
+  }
   if (Array.isArray(options.history) && options.history.length > 0) {
     try {
-      retrievalQuery = await rewriteForRetrieval(q, options.history);
-      if (retrievalQuery !== q) {
-        yield { type: "rewritten", original: q, rewritten: retrievalQuery };
+      const after = await rewriteForRetrieval(retrievalQuery, options.history);
+      if (after !== retrievalQuery) {
+        yield { type: "rewritten", original: retrievalQuery, rewritten: after, kind: "history-resolve" };
+        retrievalQuery = after;
       }
     } catch (err) {
-      log.warn({ err: err.message }, "rewriteForRetrieval threw; using original");
+      log.warn({ err: err.message }, "rewriteForRetrieval threw; using current query");
     }
   }
 

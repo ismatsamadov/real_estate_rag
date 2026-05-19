@@ -180,13 +180,30 @@ const CURRENCY_PATTERNS = [
   { re: /RUB\s?([\d.,\s]{3,})/i, currency: "RUB" },
 ];
 
-// Bedrooms: matches "3 bedrooms", "3-bedroom", "3-room", "3 otaqlı", "3-комнатная".
+// IMPORTANT: in AZ/RU real-estate convention, "rooms" ≠ "bedrooms".
+//   AZ:  "otaqlı"       = TOTAL rooms (including living room)
+//        "yataq otaqlı" = bedrooms only (yataq = sleeping)
+//   RU:  "комнатная"    = TOTAL rooms
+//        "спальня"      = bedrooms
+//   EN:  "X-bedroom"    = bedrooms
+//        "X-room"       = TOTAL rooms (ambiguous in EN; treat as total)
+// We extract these into two separate metadata fields so retrieval-time
+// filters and the LLM can keep the facts distinct.
+
+// Bedrooms: explicit bedroom phrasing only.
 const BEDROOM_PATTERNS = [
   /(\d+)\s*[-+]?\s*bedroom/i,
   /(\d+)\s*[-+]?\s*bed\b/i,
-  /(\d+)\s*[-+]?\s*room\b/i,
-  /(\d+)\s*[-+]?\s*otaq/i, // Azerbaijani
-  /(\d+)\s*[-+]?\s*комнат/i, // Russian
+  /(\d+)\s*[-+]?\s*yataq\s*otaq/i, // AZ: "yataq otaqlı" = bedroom
+  /(\d+)\s*[-+]?\s*спальн/i, // RU: "спальня" = bedroom
+];
+
+// Total rooms: "X otaqlı" / "X-комнатная" / "X-room". The AZ pattern uses
+// a negative lookbehind so "X yataq otaqlı" is NOT also matched as rooms.
+const ROOM_PATTERNS = [
+  /(\d+)\s*[-+]?\s*room\b/i, // EN "3-room", "3 rooms"
+  /(?<!yataq\s)(\d+)\s*[-+]?\s*otaq/i, // AZ "otaqlı" but NOT "yataq otaqlı"
+  /(\d+)\s*[-+]?\s*комнат/i, // RU "X-комнатная"
 ];
 
 const BATHROOM_PATTERNS = [
@@ -254,9 +271,12 @@ function extractListingMetadata(record) {
     }
   }
 
-  // Bedrooms / bathrooms / area
+  // Bedrooms / total rooms / bathrooms / area
   const bed = firstMatch(text, BEDROOM_PATTERNS);
   if (bed) out.bedrooms = parseInt(bed.match[1], 10);
+
+  const rm = firstMatch(text, ROOM_PATTERNS);
+  if (rm) out.total_rooms = parseInt(rm.match[1], 10);
 
   const bath = firstMatch(text, BATHROOM_PATTERNS);
   if (bath) out.bathrooms = parseInt(bath.match[1], 10);

@@ -1,22 +1,41 @@
 import "./globals.css";
+import { Inter, Playfair_Display } from "next/font/google";
+
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-inter",
+  display: "swap",
+});
+
+const playfair = Playfair_Display({
+  subsets: ["latin"],
+  variable: "--font-display",
+  display: "swap",
+});
 
 export const metadata = {
   title: "PASHA Real Estate Search",
   description:
     "Grounded Q&A over PASHA Real Estate's curated luxury portfolio in Baku — Crescent Residences, St. Regis Baku, Knightsbridge, Ritz-Carlton Residences.",
-  keywords: ["Baku real estate", "PASHA Real Estate", "luxury apartments", "Crescent Residences", "St Regis Baku"],
+  keywords: [
+    "Baku real estate",
+    "PASHA Real Estate",
+    "luxury apartments",
+    "Crescent Residences",
+    "St Regis Baku",
+  ],
 };
 
 export const viewport = {
-  themeColor: "#c89148",
+  themeColor: "#0a0a0a",
   width: "device-width",
   initialScale: 1,
 };
 
-export default function RootLayout({ children }) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body>{children}</body>
+    <html lang="en" className={`${inter.variable} ${playfair.variable}`}>
+      <body className="font-sans">{children}</body>
     </html>
   );
 }

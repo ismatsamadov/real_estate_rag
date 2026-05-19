@@ -26,6 +26,28 @@ const nextConfig = {
   // to get ESM parsing inside a CommonJS-rooted repo, not for type safety.
   eslint: { ignoreDuringBuilds: true },
   typescript: { ignoreBuildErrors: true },
+
+  // Strip Next.js fingerprinting from responses.
+  poweredByHeader: false,
+
+  // Baseline security headers applied to every response.
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          // Defense in depth even though SSR cookies are httpOnly+sameSite=lax.
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "X-DNS-Prefetch-Control", value: "off" },
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
+          // HSTS only matters on HTTPS; harmless on localhost.
+          { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" },
+        ],
+      },
+    ];
+  },
 };
 
 module.exports = nextConfig;

@@ -2,40 +2,256 @@
 @tailwind components;
 @tailwind utilities;
 
+/* -------------------------------------------------------------------------
+   Design tokens
+   ------------------------------------------------------------------------- */
+:root {
+  --ink: #0a0a0a;
+  --ink-soft: #18181b;
+  --ink-muted: #71717a;
+  --line: rgba(0, 0, 0, 0.08);
+  --line-strong: rgba(0, 0, 0, 0.14);
+  --surface: #ffffff;
+  --surface-soft: #fafaf9;
+  --surface-glass: rgba(255, 255, 255, 0.72);
+  --brand: #c89148;
+  --brand-deep: #8a5d2a;
+  --brand-soft: #fdf0d6;
+  --shadow-lift: 0 1px 2px rgba(0,0,0,0.04), 0 10px 32px -16px rgba(10,10,10,0.18);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.03), 0 4px 14px -8px rgba(10,10,10,0.12);
+  --ring-brand: 0 0 0 1px rgba(200,145,72,0.45), 0 0 0 4px rgba(200,145,72,0.10);
+}
+
 @layer base {
   html, body {
     @apply bg-white text-ink antialiased;
   }
   body {
-    font-feature-settings: "ss01", "cv11";
+    font-feature-settings: "ss01", "cv11", "kern";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
   }
+  ::selection {
+    background-color: rgba(200, 145, 72, 0.28);
+    color: var(--ink);
+  }
+  /* Tabular figures everywhere numbers matter */
+  .tabular { font-variant-numeric: tabular-nums; }
 }
 
+/* -------------------------------------------------------------------------
+   Components
+   ------------------------------------------------------------------------- */
 @layer components {
+  /* Cite pill — clickable [Sn] inside answer text */
   .citation-pill {
-    @apply inline-flex items-center justify-center px-1.5 mx-0.5 rounded
-           bg-brand-100 text-brand-700 font-mono text-[0.72rem]
-           cursor-pointer select-none hover:bg-brand-200 transition-colors;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.06rem 0.4rem;
+    margin: 0 0.12rem;
+    border-radius: 0.35rem;
+    background: var(--brand-soft);
+    color: var(--brand-deep);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.7rem;
+    font-weight: 600;
+    line-height: 1.4;
+    cursor: pointer;
+    user-select: none;
+    box-shadow: inset 0 0 0 1px rgba(200,145,72,0.35);
+    transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease, color 120ms ease;
+  }
+  .citation-pill:hover {
+    background: #fce3b9;
+    box-shadow: inset 0 0 0 1px rgba(200,145,72,0.7);
+    transform: translateY(-1px);
   }
   .citation-pill[data-active="true"] {
-    @apply bg-brand-500 text-white;
+    background: var(--ink);
+    color: white;
+    box-shadow: inset 0 0 0 1px var(--ink);
   }
+
+  /* Source card */
   .source-card {
-    @apply border border-zinc-200 rounded-lg p-3 hover:border-brand-500 transition-colors;
+    position: relative;
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: white;
+    border: 1px solid var(--line);
+    border-radius: 0.875rem;
+    padding: 0.875rem 1rem;
+    transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+    cursor: pointer;
+  }
+  .source-card:hover {
+    border-color: var(--line-strong);
+    box-shadow: var(--shadow-card);
   }
   .source-card[data-active="true"] {
-    @apply border-brand-500 ring-2 ring-brand-200;
+    border-color: rgba(200,145,72,0.6);
+    box-shadow: var(--ring-brand), var(--shadow-card);
   }
+  .source-card::before {
+    content: "";
+    position: absolute;
+    inset: 0.75rem 0;
+    left: 0;
+    width: 3px;
+    background: linear-gradient(180deg, transparent, var(--brand) 30%, var(--brand) 70%, transparent);
+    border-radius: 0 0.25rem 0.25rem 0;
+    opacity: 0;
+    transition: opacity 220ms ease;
+  }
+  .source-card[data-active="true"]::before {
+    opacity: 1;
+  }
+
+  /* Skeleton (loading placeholder) */
+  .skeleton {
+    @apply bg-zinc-100 rounded;
+    background-image: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+    background-size: 200% 100%;
+    animation: shimmer 1.6s infinite;
+  }
+
+  /* Glass surface — used by login + search bar */
+  .glass {
+    background: var(--surface-glass);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.65);
+    box-shadow: var(--shadow-lift);
+  }
+
+  /* Status pill */
+  .status-pill {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs;
+  }
+
   .badge {
-    @apply inline-flex items-center px-1.5 py-0.5 rounded text-[0.68rem] font-medium;
+    @apply inline-flex items-center px-1.5 py-0.5 rounded text-[0.68rem] font-medium tracking-tight;
+  }
+
+  /* Fading horizontal divider */
+  .hr-fade {
+    height: 1px;
+    width: 100%;
+    background: linear-gradient(
+      to right,
+      transparent,
+      var(--line) 22%,
+      var(--line) 78%,
+      transparent
+    );
+  }
+
+  /* Button base */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 font-medium
+           transition-all duration-150 select-none;
+  }
+  .btn-primary {
+    @apply btn px-5 py-3 rounded-xl bg-ink text-white shadow-card;
+  }
+  .btn-primary:hover { background: #2a2a2a; transform: translateY(-1px); }
+  .btn-primary:disabled { opacity: 0.32; transform: none; }
+  .btn-ghost {
+    @apply btn px-3 py-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-zinc-100;
+  }
+  .btn-stop {
+    @apply btn px-5 py-3 rounded-xl bg-zinc-100 hover:bg-zinc-200 text-ink;
   }
 }
 
-/* Subtle text-cursor for streaming answer */
-@keyframes blink { 50% { opacity: 0; } }
+/* -------------------------------------------------------------------------
+   Animations
+   ------------------------------------------------------------------------- */
+@keyframes blink {
+  50% { opacity: 0; }
+}
 .streaming-cursor::after {
   content: "▎";
+  display: inline-block;
   margin-left: 2px;
   animation: blink 1s steps(2, start) infinite;
-  color: theme('colors.brand.500');
+  color: var(--brand);
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fade-up 320ms ease-out both; }
+
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.5; }
+  50%      { opacity: 1; }
+}
+.pulse-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+
+/* -------------------------------------------------------------------------
+   Prose tweaks on top of @tailwindcss/typography
+   ------------------------------------------------------------------------- */
+.prose :where(p, li, td):not(:where([class~="not-prose"] *)) code {
+  @apply px-1 py-0.5 rounded bg-zinc-100 text-ink text-[0.86em] font-mono;
+}
+.prose :where(table):not(:where([class~="not-prose"] *)) {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  overflow: hidden;
+  font-size: 0.92em;
+}
+.prose :where(thead):not(:where([class~="not-prose"] *)) {
+  background: var(--surface-soft);
+}
+.prose :where(th):not(:where([class~="not-prose"] *)) {
+  text-align: left;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.72em;
+  color: var(--ink-muted);
+  font-weight: 500;
+  border-bottom: 1px solid var(--line);
+}
+.prose :where(td, th):not(:where([class~="not-prose"] *)) {
+  padding: 0.5rem 0.75rem;
+}
+.prose :where(td):not(:where([class~="not-prose"] *)) {
+  border-top: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+.prose :where(blockquote):not(:where([class~="not-prose"] *)) {
+  border-left: 2px solid var(--brand);
+  font-style: italic;
+  color: var(--ink-soft);
+}
+
+/* -------------------------------------------------------------------------
+   Focus rings — consistent across all interactive elements
+   ------------------------------------------------------------------------- */
+*:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-brand);
+}
+input:focus-visible,
+button:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
 }

@@ -89,6 +89,13 @@ const schema = z.object({
   AXIOM_DATASET: z.string().optional().default(""),
   AXIOM_TOKEN: z.string().optional().default(""),
   OTEL_SERVICE_NAME: z.string().default("real-estate-rag"),
+
+  // Demo auth — single shared credential for the gated demo UI.
+  // Both are REQUIRED (no defaults) so the app cannot accidentally ship
+  // with a guessable credential. NOT production auth — swap to NextAuth +
+  // a real IdP for anything beyond a sealed demo.
+  DEMO_USERNAME: z.string().min(1, "DEMO_USERNAME is required"),
+  DEMO_PASSWORD: z.string().min(8, "DEMO_PASSWORD must be at least 8 characters"),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -201,6 +208,11 @@ const config = Object.freeze({
     axiomToken: env.AXIOM_TOKEN,
     serviceName: env.OTEL_SERVICE_NAME,
     enabled: Boolean(env.AXIOM_DATASET && env.AXIOM_TOKEN),
+  }),
+
+  auth: Object.freeze({
+    username: env.DEMO_USERNAME,
+    password: env.DEMO_PASSWORD,
   }),
 });
 

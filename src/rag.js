@@ -54,9 +54,13 @@ const REWRITE_SYSTEM = [
  * Negative lookbehind protects "yataq otaqlı" / "спальня" — those are
  * explicit bedroom counts and must not be converted. Runs unconditionally
  * (no LLM call) so first-turn questions get the right retrieval target.
+ *
+ * Unicode-aware: the `u` flag + `\p{L}` lookahead replaces `\b`, because
+ * Node's default `\b` is ASCII-only and silently fails after non-ASCII
+ * letters like Azerbaijani "ı" (U+0131) or Cyrillic "комнатн".
  */
-const OTAQLI_RE = /(?<!yataq\s)(\b\d+)\s*[-\s]?\s*otaq(?:lı|li)?\b/gi;
-const KOMNATNAYA_RE = /(?<!спальня\s)(\b\d+)\s*[-\s]?\s*комнатн(?:ая|ой|ую|ые|ых)?\b/gi;
+const OTAQLI_RE = /(?<!yataq\s)(\d+)\s*[-\s]?\s*otaq(?:lı|li)?(?=\s|[^\p{L}\d]|$)/giu;
+const KOMNATNAYA_RE = /(?<!спальня\s)(\d+)\s*[-\s]?\s*комнатн(?:ая|ой|ую|ые|ых)?(?=\s|[^\p{L}\d]|$)/giu;
 
 function preprocessRoomTerminology(text) {
   if (!text) return text;

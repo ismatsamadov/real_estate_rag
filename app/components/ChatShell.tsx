@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Header from "./Header";
 import Sidebar from "./Sidebar";
 import ChatView from "./ChatView";
+import { FavoritesProvider } from "./FavoritesContext";
 
 /**
  * Top-level shell that wires together:
@@ -50,27 +51,29 @@ export default function ChatShell() {
   }, []);
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <Header onToggleSidebar={() => setSidebarOpen((o) => !o)} />
+    <FavoritesProvider>
+      <div className="min-h-screen flex flex-col">
+        <Header onToggleSidebar={() => setSidebarOpen((o) => !o)} />
 
-      <div className="flex-1 flex">
-        <Sidebar
-          activeSessionId={activeSessionId}
-          onSelect={handleSelect}
-          onNew={handleNew}
-          refreshKey={refreshKey}
-          isOpen={sidebarOpen}
-          onClose={() => setSidebarOpen(false)}
-        />
-
-        <main className="flex-1 min-w-0">
-          <ChatView
-            key={activeSessionId || "new"}
-            sessionId={activeSessionId}
-            onSessionCreated={handleSessionCreated}
+        <div className="flex-1 flex">
+          <Sidebar
+            activeSessionId={activeSessionId}
+            onSelect={handleSelect}
+            onNew={handleNew}
+            refreshKey={refreshKey}
+            isOpen={sidebarOpen}
+            onClose={() => setSidebarOpen(false)}
           />
-        </main>
+
+          <main className="flex-1 min-w-0">
+            <ChatView
+              key={activeSessionId || "new"}
+              sessionId={activeSessionId}
+              onSessionCreated={handleSessionCreated}
+            />
+          </main>
+        </div>
       </div>
-    </div>
+    </FavoritesProvider>
   );
 }

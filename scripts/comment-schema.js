@@ -51,6 +51,11 @@ const TABLE_COMMENTS = {
     as the corpus so similarity search composes cleanly. Recalled in new
     sessions to give the LLM continuity context — NEVER cited as a factual
     source ([Mn] in prompts is advisory only).`,
+
+  favorites: `Per-user saved listings ("hearts" in the UI). One row per
+    (user_id, doc_id) — UNIQUE constraint makes the "save" action
+    idempotent. Cascades on document deletion so a corpus rebuild doesn't
+    leave orphaned bookmarks.`,
 };
 
 // ---------------------------------------------------------------------------
@@ -143,6 +148,18 @@ const COLUMN_COMMENTS = {
     "JSONB with previews of the original question/answer (for inspection — full content lives in the 'content' column).",
   "conversation_memory.created_at":
     "Memory write time. Used in the recency-boosted recall score (newer memories edge out same-similarity older ones; ~14d half-life).",
+
+  // ---- favorites ---------------------------------------------------------
+  "favorites.id":
+    "Surrogate PK. Used by the DELETE endpoint to unsave a specific bookmark.",
+  "favorites.user_id":
+    "Owner. UNIQUE(user_id, doc_id) prevents duplicate saves and makes the POST endpoint idempotent.",
+  "favorites.doc_id":
+    "FK to documents(doc_id) ON DELETE CASCADE. Favoriting points at the WHOLE page, not a specific chunk — saving a listing across re-chunking is the right granularity.",
+  "favorites.note":
+    "Optional user-written note attached to the bookmark (\"good price\", \"check sea view\", etc.). NULL by default.",
+  "favorites.created_at":
+    "When the user saved this listing. Used to order the Saved panel (most-recently-saved first).",
 };
 
 // ---------------------------------------------------------------------------

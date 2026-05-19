@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useFavorites } from "./FavoritesContext";
 
 type MemoryChip = {
   mid: string;
@@ -689,6 +690,7 @@ function SourceCard({
   if (m.listing_type) facts.push({ key: "ltype", value: m.listing_type, tone: "brand" });
 
   const score = source.rerank_score || source.rrf_score || source.vector_score || 0;
+  const isListing = (m.doc_type || "").toLowerCase() === "listing";
 
   return (
     <div ref={refFn} className="source-card cursor-pointer" data-active={active} onClick={onClick}>
@@ -702,7 +704,21 @@ function SourceCard({
             <span className="badge bg-zinc-100 text-zinc-700 uppercase">{m.language}</span>
           )}
         </div>
-        <div className="text-[0.7rem] font-mono tabular text-ink-muted">{score.toFixed(2)}</div>
+        <div className="flex items-center gap-1.5">
+          {isListing && source.doc_id && (
+            <FavoriteHeart
+              docId={source.doc_id}
+              extra={{
+                url: source.url,
+                title: m.location || prettifyPath(pathName) || host,
+                doc_type: m.doc_type,
+                language: m.language,
+                metadata: m,
+              }}
+            />
+          )}
+          <div className="text-[0.7rem] font-mono tabular text-ink-muted">{score.toFixed(2)}</div>
+        </div>
       </div>
       <div className="text-sm font-medium text-ink line-clamp-2 mb-1 leading-snug">{titleText}</div>
       {facts.length > 0 && (
@@ -764,6 +780,44 @@ function SourceCard({
         </div>
       )}
     </div>
+  );
+}
+
+function FavoriteHeart({
+  docId,
+  extra,
+}: {
+  docId: string;
+  extra?: any;
+}) {
+  const { savedIds, toggle } = useFavorites();
+  const saved = savedIds.has(docId);
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        toggle(docId, extra);
+      }}
+      aria-pressed={saved}
+      aria-label={saved ? "Unsave listing" : "Save listing"}
+      title={saved ? "Saved — click to unsave" : "Save for later"}
+      className={`inline-flex items-center justify-center w-6 h-6 rounded transition-all
+        ${saved
+          ? "text-rose-500 hover:bg-rose-50"
+          : "text-zinc-300 hover:text-rose-500 hover:bg-rose-50"}`}
+    >
+      <svg
+        className="w-3.5 h-3.5 transition-transform hover:scale-110"
+        fill={saved ? "currentColor" : "none"}
+        stroke="currentColor"
+        strokeWidth="2"
+        viewBox="0 0 24 24"
+        aria-hidden
+      >
+        <path d="M12 21s-7-4.35-7-10a4 4 0 0 1 7-2.65A4 4 0 0 1 19 11c0 5.65-7 10-7 10z" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    </button>
   );
 }
 

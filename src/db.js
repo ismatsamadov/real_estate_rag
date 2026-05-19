@@ -28,6 +28,7 @@ const DOCS_TABLE = quoteIdent("documents");
 const SESSIONS_TABLE = quoteIdent("sessions");
 const MESSAGES_TABLE = quoteIdent("messages");
 const MEMORY_TABLE = quoteIdent("conversation_memory");
+const FAVORITES_TABLE = quoteIdent("favorites");
 const HNSW_INDEX = quoteIdent(`${config.db.table}_embedding_hnsw_idx`);
 const TSV_INDEX = quoteIdent(`${config.db.table}_tsv_gin_idx`);
 const DOC_INDEX = quoteIdent(`${config.db.table}_doc_id_idx`);
@@ -39,6 +40,7 @@ const SESSIONS_USER_INDEX = quoteIdent("sessions_user_updated_idx");
 const MESSAGES_SESSION_INDEX = quoteIdent("messages_session_created_idx");
 const MEMORY_USER_INDEX = quoteIdent("conversation_memory_user_idx");
 const MEMORY_HNSW_INDEX = quoteIdent("conversation_memory_embedding_hnsw_idx");
+const FAVORITES_USER_INDEX = quoteIdent("favorites_user_created_idx");
 
 async function withClient(fn) {
   const client = await pool.connect();
@@ -188,6 +190,25 @@ async function ensureSchema() {
         ON ${MEMORY_TABLE} USING hnsw (embedding vector_cosine_ops)
         WITH (m = 16, ef_construction = 64)
     `);
+
+    // Favorites — saved listings per user.
+    // UNIQUE(user_id, doc_id) makes "save" idempotent (clicking the heart
+    // twice in quick succession produces at most one row). ON DELETE
+    // CASCADE on doc_id keeps the table clean when the corpus is rebuilt.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ${FAVORITES_TABLE} (
+        id          BIGSERIAL PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        doc_id      TEXT NOT NULL REFERENCES ${DOCS_TABLE}(doc_id) ON DELETE CASCADE,
+        note        TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (user_id, doc_id)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS ${FAVORITES_USER_INDEX}
+        ON ${FAVORITES_TABLE} (user_id, created_at DESC)
+    `);
   });
   log.info(
     {
@@ -203,6 +224,7 @@ async function ensureSchema() {
 
 async function dropSchema() {
   await withClient(async (client) => {
+    await client.query(`DROP TABLE IF EXISTS ${FAVORITES_TABLE} CASCADE`);
     await client.query(`DROP TABLE IF EXISTS ${MEMORY_TABLE} CASCADE`);
     await client.query(`DROP TABLE IF EXISTS ${MESSAGES_TABLE} CASCADE`);
     await client.query(`DROP TABLE IF EXISTS ${SESSIONS_TABLE} CASCADE`);
@@ -242,6 +264,7 @@ module.exports = {
   SESSIONS_TABLE,
   MESSAGES_TABLE,
   MEMORY_TABLE,
+  FAVORITES_TABLE,
   // Back-compat alias used by older modules.
   TABLE: CHUNKS_TABLE,
   quoteIdent,

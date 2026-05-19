@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    @apply bg-white text-ink antialiased;
+  }
+  body {
+    font-feature-settings: "ss01", "cv11";
+  }
+}
+
+@layer components {
+  .citation-pill {
+    @apply inline-flex items-center justify-center px-1.5 mx-0.5 rounded
+           bg-brand-100 text-brand-700 font-mono text-[0.72rem]
+           cursor-pointer select-none hover:bg-brand-200 transition-colors;
+  }
+  .citation-pill[data-active="true"] {
+    @apply bg-brand-500 text-white;
+  }
+  .source-card {
+    @apply border border-zinc-200 rounded-lg p-3 hover:border-brand-500 transition-colors;
+  }
+  .source-card[data-active="true"] {
+    @apply border-brand-500 ring-2 ring-brand-200;
+  }
+  .badge {
+    @apply inline-flex items-center px-1.5 py-0.5 rounded text-[0.68rem] font-medium;
+  }
+}
+
+/* Subtle text-cursor for streaming answer */
+@keyframes blink { 50% { opacity: 0; } }
+.streaming-cursor::after {
+  content: "▎";
+  margin-left: 2px;
+  animation: blink 1s steps(2, start) infinite;
+  color: theme('colors.brand.500');
+}

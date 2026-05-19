@@ -1,0 +1,20 @@
+# Don't ship the local corpus + screenshots — keeps deploys fast.
+data/
+screenshots/
+
+# Scripts run locally (scrape, ingest, eval, migrate); not needed at runtime.
+scripts/
+
+# Legacy Express UI (replaced by Next.js app/).
+web/
+
+# Misc
+.env
+.env.local
+.env.development
+.env.development.local
+.env.production
+.env.production.local
+.next/
+*.log
+.DS_Store

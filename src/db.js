@@ -11,6 +11,8 @@ const pool = new Pool({
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
+  // Neon requires SSL; keep relaxed verification off in prod environments
+  // where the connection string already encodes sslmode=require.
 });
 
 pool.on("error", (err) => {
@@ -21,10 +23,15 @@ function quoteIdent(name) {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
-const TABLE = quoteIdent(config.db.table);
+const CHUNKS_TABLE = quoteIdent(config.db.table);
+const DOCS_TABLE = quoteIdent("documents");
 const HNSW_INDEX = quoteIdent(`${config.db.table}_embedding_hnsw_idx`);
 const TSV_INDEX = quoteIdent(`${config.db.table}_tsv_gin_idx`);
 const DOC_INDEX = quoteIdent(`${config.db.table}_doc_id_idx`);
+const CHUNK_META_INDEX = quoteIdent(`${config.db.table}_metadata_gin_idx`);
+const DOCS_META_INDEX = quoteIdent("documents_metadata_gin_idx");
+const DOCS_TYPE_INDEX = quoteIdent("documents_doc_type_idx");
+const DOCS_LANG_INDEX = quoteIdent("documents_language_idx");
 
 async function withClient(fn) {
   const client = await pool.connect();
@@ -38,52 +45,94 @@ async function withClient(fn) {
 async function ensureSchema() {
   await withClient(async (client) => {
     await client.query("CREATE EXTENSION IF NOT EXISTS vector");
+
+    // Parent table — one row per scraped page/listing.
+    // Holds doc-level metadata (price, location, language, type) so we can
+    // filter at retrieval time without scanning chunks.
     await client.query(`
-      CREATE TABLE IF NOT EXISTS ${TABLE} (
-        id BIGSERIAL PRIMARY KEY,
-        doc_id TEXT NOT NULL,
-        url TEXT NOT NULL,
-        chunk_index INTEGER NOT NULL,
-        content TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-        embedding vector(${config.embedding.dim}) NOT NULL,
-        tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CREATE TABLE IF NOT EXISTS ${DOCS_TABLE} (
+        doc_id        TEXT PRIMARY KEY,
+        url           TEXT NOT NULL UNIQUE,
+        title         TEXT,
+        doc_type      TEXT NOT NULL DEFAULT 'article',
+        language      TEXT NOT NULL DEFAULT 'en',
+        metadata      JSONB NOT NULL DEFAULT '{}'::jsonb,
+        source_hash   TEXT,
+        scraped_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS ${DOCS_META_INDEX}
+        ON ${DOCS_TABLE} USING gin (metadata jsonb_path_ops)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS ${DOCS_TYPE_INDEX} ON ${DOCS_TABLE} (doc_type)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS ${DOCS_LANG_INDEX} ON ${DOCS_TABLE} (language)
+    `);
+
+    // Chunks table — many per document.
+    // tsvector uses 'simple' config (no stemming) so multilingual content
+    // (Azerbaijani / Russian / English) all index correctly. Stemming would
+    // break exact-term matching for addresses, prices, neighborhood names.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ${CHUNKS_TABLE} (
+        id            BIGSERIAL PRIMARY KEY,
+        doc_id        TEXT NOT NULL REFERENCES ${DOCS_TABLE}(doc_id) ON DELETE CASCADE,
+        url           TEXT NOT NULL,
+        chunk_index   INTEGER NOT NULL,
+        content       TEXT NOT NULL,
+        content_hash  TEXT NOT NULL,
+        metadata      JSONB NOT NULL DEFAULT '{}'::jsonb,
+        embedding     vector(${config.embedding.dim}) NOT NULL,
+        tsv           tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (doc_id, chunk_index)
       )
     `);
 
-    // HNSW for high-quality ANN, no training step required.
+    // HNSW for cosine ANN — m=16 / ef_construction=64 are pgvector's defaults
+    // and handle our corpus size (<1M vectors) with no training step.
     await client.query(`
       CREATE INDEX IF NOT EXISTS ${HNSW_INDEX}
-      ON ${TABLE}
-      USING hnsw (embedding vector_cosine_ops)
-      WITH (m = 16, ef_construction = 64)
+        ON ${CHUNKS_TABLE} USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64)
     `);
-
-    // GIN over the generated tsvector for lexical retrieval.
     await client.query(`
-      CREATE INDEX IF NOT EXISTS ${TSV_INDEX}
-      ON ${TABLE}
-      USING gin (tsv)
+      CREATE INDEX IF NOT EXISTS ${TSV_INDEX} ON ${CHUNKS_TABLE} USING gin (tsv)
     `);
-
-    // Lookup index for doc-level operations (delete by doc, count, etc.).
     await client.query(`
-      CREATE INDEX IF NOT EXISTS ${DOC_INDEX}
-      ON ${TABLE} (doc_id)
+      CREATE INDEX IF NOT EXISTS ${DOC_INDEX} ON ${CHUNKS_TABLE} (doc_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS ${CHUNK_META_INDEX}
+        ON ${CHUNKS_TABLE} USING gin (metadata jsonb_path_ops)
     `);
   });
-  log.info({ table: config.db.table, dim: config.embedding.dim }, "schema ready");
+  log.info(
+    { docsTable: "documents", chunksTable: config.db.table, dim: config.embedding.dim },
+    "schema ready",
+  );
+}
+
+async function dropSchema() {
+  await withClient(async (client) => {
+    await client.query(`DROP TABLE IF EXISTS ${CHUNKS_TABLE} CASCADE`);
+    await client.query(`DROP TABLE IF EXISTS ${DOCS_TABLE} CASCADE`);
+  });
+  log.warn({ docsTable: "documents", chunksTable: config.db.table }, "schema dropped");
 }
 
 async function analyze() {
-  await pool.query(`ANALYZE ${TABLE}`);
+  await pool.query(`ANALYZE ${CHUNKS_TABLE}`);
+  await pool.query(`ANALYZE ${DOCS_TABLE}`);
 }
 
-async function pingPing() {
+async function ping() {
   const res = await pool.query("SELECT 1 AS ok");
   return res.rows[0]?.ok === 1;
 }
@@ -96,9 +145,13 @@ module.exports = {
   pool,
   withClient,
   ensureSchema,
+  dropSchema,
   analyze,
-  ping: pingPing,
+  ping,
   close,
-  TABLE,
+  CHUNKS_TABLE,
+  DOCS_TABLE,
+  // Back-compat alias used by older modules.
+  TABLE: CHUNKS_TABLE,
   quoteIdent,
 };

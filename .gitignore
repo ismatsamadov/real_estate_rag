@@ -5,7 +5,7 @@ node_modules/
 # Logs
 *.log
 npm-debug.log*
-
+.claude
 # Generated corpora and caches
 data/*.jsonl
 data/*.json
@@ -17,3 +17,4 @@ data/*.json
 Thumbs.db
 .vscode/
 .idea/
+.next

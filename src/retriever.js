@@ -1,85 +1,148 @@
 "use strict";
 
+/**
+ * Hybrid retrieval with rerank + LRU cache + metadata filtering.
+ *
+ *   1. Embed query (asymmetric: inputType="query").
+ *   2. Pull `candidateK` chunks via one of:
+ *         hybrid  -> vector kNN + BM25-style FTS fused via RRF in one CTE
+ *         vector  -> ANN only
+ *         lexical -> FTS only
+ *      Filters (language, doc_type, listing_type, price/bedrooms ranges)
+ *      apply at the SQL layer using the chunks' jsonb metadata + GIN.
+ *   3. Optional cross-encoder rerank via Voyage rerank-2.5 (RAG_RERANK=true).
+ *      Rerank fixes ANN errors at low cost (~$0.05/1k queries).
+ *   4. Trim to `topK` and shape for the LLM.
+ *
+ * Returns: { sources, mode, reranked, fallback, cached }
+ *
+ * Cache: in-process LRU keyed by (mode, normalizedQuery, filters, topK,
+ * candidateK, rerankFlag). 5-minute TTL. Cuts repeat-query latency to <5ms.
+ */
+
+const { LRUCache } = require("lru-cache");
+
 const config = require("./config");
 const db = require("./db");
-const { embed, toVectorLiteral } = require("./embedder");
+const { embed, rerank, toVectorLiteral } = require("./embedder");
 const logger = require("./logger");
 
 const log = logger.child({ component: "retriever" });
 
-function pageKindFromUrl(url) {
-  try {
-    const pathname = new URL(url).pathname;
-    const first = pathname.split("/").filter(Boolean)[0] || "";
-    return first || "homepage";
-  } catch {
-    return "unknown";
-  }
+// ---------------------------------------------------------------------------
+// LRU cache
+// ---------------------------------------------------------------------------
+
+const cache = config.retrieval.cacheTtlMs > 0
+  ? new LRUCache({
+      max: config.retrieval.cacheMax,
+      ttl: config.retrieval.cacheTtlMs,
+    })
+  : null;
+
+function cacheKey({ q, mode, topK, candidateK, doRerank, filters }) {
+  return JSON.stringify({
+    q: q.toLowerCase().replace(/\s+/g, " ").trim(),
+    mode,
+    topK,
+    candidateK,
+    doRerank,
+    filters,
+  });
 }
 
-function pickFirst(...values) {
-  for (const v of values) {
-    const s = String(v || "").trim();
-    if (s) return s;
-  }
-  return "";
-}
+// ---------------------------------------------------------------------------
+// Metadata filter SQL builder
+// ---------------------------------------------------------------------------
 
-function parseMetadata(raw, url) {
-  let meta = {};
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) meta = raw;
-  else if (typeof raw === "string") {
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) meta = parsed;
-    } catch {
-      meta = {};
+/**
+ * Build a parameterized WHERE clause + values array from a structured
+ * filters object. Filters live on the chunks' jsonb metadata column
+ * (we duplicate doc-level facts down so retrieval can filter without joining).
+ *
+ *   filters: {
+ *     language: "en" | ["en","ru"],
+ *     doc_type: "listing" | ["listing","article"],
+ *     listing_type: "sale" | "rent",
+ *     property_type: "apartment",
+ *     price_min: number, price_max: number,
+ *     bedrooms_min: number, bedrooms_max: number,
+ *     area_min: number, area_max: number,
+ *   }
+ *
+ * Returns { clause, values, nextParam } where nextParam is the next $N
+ * to use after the filter values are bound.
+ */
+function buildFilterClause(filters, startIdx = 1) {
+  const conditions = [];
+  const values = [];
+  let idx = startIdx;
+
+  const eq = (key, val) => {
+    if (Array.isArray(val)) {
+      // ANY match for arrays
+      conditions.push(`(c.metadata->>'${key}') = ANY($${idx}::text[])`);
+      values.push(val.map(String));
+    } else {
+      conditions.push(`c.metadata->>'${key}' = $${idx}`);
+      values.push(String(val));
     }
-  }
-  const sourceUrl = pickFirst(meta.sourceURL, meta.url, url);
+    idx += 1;
+  };
+
+  const range = (key, min, max, cast = "numeric") => {
+    if (min != null) {
+      conditions.push(`(c.metadata->>'${key}')::${cast} >= $${idx}`);
+      values.push(Number(min));
+      idx += 1;
+    }
+    if (max != null) {
+      conditions.push(`(c.metadata->>'${key}')::${cast} <= $${idx}`);
+      values.push(Number(max));
+      idx += 1;
+    }
+  };
+
+  if (filters?.language) eq("language", filters.language);
+  if (filters?.doc_type) eq("doc_type", filters.doc_type);
+  if (filters?.listing_type) eq("listing_type", filters.listing_type);
+  if (filters?.property_type) eq("property_type", filters.property_type);
+  range("price", filters?.price_min, filters?.price_max);
+  range("bedrooms", filters?.bedrooms_min, filters?.bedrooms_max, "int");
+  range("area_sqm", filters?.area_min, filters?.area_max);
+
   return {
-    title: pickFirst(meta.title, meta.ogTitle, meta["og:title"], meta["twitter:title"]),
-    description: pickFirst(
-      meta.description,
-      meta.ogDescription,
-      meta["og:description"],
-      meta["twitter:description"]
-    ),
-    language: pickFirst(meta.language, meta.lang).toLowerCase(),
-    contentType: pickFirst(meta.contentType),
-    pageKind: pageKindFromUrl(sourceUrl),
-    statusCode: Number(meta.statusCode) || null,
-    sourceURL: sourceUrl,
+    clause: conditions.length ? `AND ${conditions.join(" AND ")}` : "",
+    values,
+    nextParam: idx,
   };
 }
 
-function snippet(text, maxLen = 240) {
-  const clean = String(text || "").replace(/\s+/g, " ").trim();
-  return clean.length <= maxLen ? clean : `${clean.slice(0, maxLen)}...`;
-}
+// ---------------------------------------------------------------------------
+// Search SQL
+// ---------------------------------------------------------------------------
 
-/**
- * Hybrid retrieval: vector kNN + Postgres full-text search, fused via
- * Reciprocal Rank Fusion (RRF, k=60 by default).
- *
- * RRF is rank-only, so it's robust to scale differences between cosine
- * similarity and ts_rank_cd, and well-supported in the IR literature
- * (Cormack et al. 2009).
- */
-async function hybridSearch({ queryEmbedding, queryText, candidateK, topK, rrfK }) {
+async function hybridSearch({ qv, qt, candidateK, rrfK, filters }) {
+  // The filter clause is referenced twice (once per subquery). pg's
+  // positional $N binding means we duplicate the values with two distinct
+  // parameter offsets.
+  const f1 = buildFilterClause(filters, 5);
+  const f2 = buildFilterClause(filters, f1.nextParam);
+
   const sql = `
     WITH params AS (
       SELECT
         $1::vector AS qv,
-        plainto_tsquery('english', $2) AS qt,
-        $3::int   AS candidate_k,
-        $4::int   AS rrf_k
+        plainto_tsquery('simple', $2) AS qt,
+        $3::int AS candidate_k,
+        $4::int AS rrf_k
     ),
     vector_hits AS (
       SELECT c.id,
              ROW_NUMBER() OVER (ORDER BY c.embedding <=> p.qv) AS rnk,
              1 - (c.embedding <=> p.qv) AS sim
-      FROM ${db.TABLE} c, params p
+      FROM ${db.CHUNKS_TABLE} c, params p
+      WHERE TRUE ${f1.clause}
       ORDER BY c.embedding <=> p.qv
       LIMIT (SELECT candidate_k FROM params)
     ),
@@ -87,8 +150,8 @@ async function hybridSearch({ queryEmbedding, queryText, candidateK, topK, rrfK 
       SELECT c.id,
              ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.tsv, p.qt) DESC) AS rnk,
              ts_rank_cd(c.tsv, p.qt) AS lex
-      FROM ${db.TABLE} c, params p
-      WHERE c.tsv @@ p.qt
+      FROM ${db.CHUNKS_TABLE} c, params p
+      WHERE c.tsv @@ p.qt ${f2.clause}
       ORDER BY ts_rank_cd(c.tsv, p.qt) DESC
       LIMIT (SELECT candidate_k FROM params)
     ),
@@ -107,65 +170,92 @@ async function hybridSearch({ queryEmbedding, queryText, candidateK, topK, rrfK 
       COALESCE(l.lex, 0) AS lexical_score,
       f.rrf_score
     FROM fused f
-    JOIN ${db.TABLE} c ON c.id = f.id
+    JOIN ${db.CHUNKS_TABLE} c ON c.id = f.id
     LEFT JOIN vector_hits v ON v.id = f.id
     LEFT JOIN lexical_hits l ON l.id = f.id
     ORDER BY f.rrf_score DESC
-    LIMIT $5::int
+    LIMIT (SELECT candidate_k FROM params)
   `;
-  const { rows } = await db.pool.query(sql, [
-    toVectorLiteral(queryEmbedding),
-    queryText,
-    candidateK,
-    rrfK,
-    topK,
-  ]);
+
+  const values = [qv, qt, candidateK, rrfK, ...f1.values, ...f2.values];
+  const { rows } = await db.pool.query(sql, values);
   return rows;
 }
 
-async function vectorSearch({ queryEmbedding, topK }) {
+async function vectorSearch({ qv, candidateK, filters }) {
+  const { clause, values: fvals } = buildFilterClause(filters, 3);
   const sql = `
     SELECT
-      id, doc_id, url, chunk_index, content, metadata,
-      1 - (embedding <=> $1::vector) AS vector_score,
+      c.id, c.doc_id, c.url, c.chunk_index, c.content, c.metadata,
+      1 - (c.embedding <=> $1::vector) AS vector_score,
       0::double precision AS lexical_score,
       0::double precision AS rrf_score
-    FROM ${db.TABLE}
-    ORDER BY embedding <=> $1::vector
+    FROM ${db.CHUNKS_TABLE} c
+    WHERE TRUE ${clause}
+    ORDER BY c.embedding <=> $1::vector
     LIMIT $2::int
   `;
-  const { rows } = await db.pool.query(sql, [toVectorLiteral(queryEmbedding), topK]);
+  const { rows } = await db.pool.query(sql, [qv, candidateK, ...fvals]);
   return rows;
 }
 
-async function lexicalSearch({ queryText, topK }) {
+async function lexicalSearch({ qt, candidateK, filters }) {
+  const { clause, values: fvals } = buildFilterClause(filters, 3);
   const sql = `
     SELECT
-      id, doc_id, url, chunk_index, content, metadata,
+      c.id, c.doc_id, c.url, c.chunk_index, c.content, c.metadata,
       0::double precision AS vector_score,
-      ts_rank_cd(tsv, plainto_tsquery('english', $1)) AS lexical_score,
+      ts_rank_cd(c.tsv, plainto_tsquery('simple', $1)) AS lexical_score,
       0::double precision AS rrf_score
-    FROM ${db.TABLE}
-    WHERE tsv @@ plainto_tsquery('english', $1)
-    ORDER BY ts_rank_cd(tsv, plainto_tsquery('english', $1)) DESC
+    FROM ${db.CHUNKS_TABLE} c
+    WHERE c.tsv @@ plainto_tsquery('simple', $1) ${clause}
+    ORDER BY ts_rank_cd(c.tsv, plainto_tsquery('simple', $1)) DESC
     LIMIT $2::int
   `;
-  const { rows } = await db.pool.query(sql, [queryText, topK]);
+  const { rows } = await db.pool.query(sql, [qt, candidateK, ...fvals]);
   return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Row shaping
+// ---------------------------------------------------------------------------
+
+function snippet(text, maxLen = 240) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  return clean.length <= maxLen ? clean : `${clean.slice(0, maxLen)}...`;
+}
+
+function parseMetadata(raw) {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    try {
+      const p = JSON.parse(raw);
+      if (p && typeof p === "object" && !Array.isArray(p)) return p;
+    } catch {
+      /* ignore */
+    }
+  }
+  return {};
 }
 
 function shapeRows(rows) {
   return rows.map((row, i) => {
-    const metadata = parseMetadata(row.metadata, row.url);
+    const metadata = parseMetadata(row.metadata);
     return {
       sid: `S${i + 1}`,
       id: Number(row.id),
       doc_id: row.doc_id,
-      url: metadata.sourceURL || row.url,
+      url: row.url,
       chunk_index: row.chunk_index,
-      score: Number(row.rrf_score) || Number(row.vector_score) || 0,
+      score:
+        Number(row.rerank_score) ||
+        Number(row.rrf_score) ||
+        Number(row.vector_score) ||
+        0,
+      rerank_score: Number(row.rerank_score) || null,
       vector_score: Number(row.vector_score) || 0,
       lexical_score: Number(row.lexical_score) || 0,
+      rrf_score: Number(row.rrf_score) || 0,
       content: row.content,
       snippet: snippet(row.content),
       metadata,
@@ -173,53 +263,114 @@ function shapeRows(rows) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Top-level retrieve
+// ---------------------------------------------------------------------------
+
 /**
  * Retrieve top-K source chunks for a question.
  *
  * @param {string} question
- * @param {{ topK?: number, candidateK?: number, mode?: 'hybrid'|'vector'|'lexical' }} [opts]
+ * @param {object} opts
+ * @param {number} [opts.topK]
+ * @param {number} [opts.candidateK]
+ * @param {'hybrid'|'vector'|'lexical'} [opts.mode]
+ * @param {object} [opts.filters]
+ * @param {boolean} [opts.rerank]
+ * @returns {Promise<{ sources, mode, reranked, fallback, cached }>}
  */
 async function retrieve(question, opts = {}) {
   const q = String(question || "").trim();
-  if (!q) return { sources: [], mode: "vector" };
+  if (!q) return { sources: [], mode: "vector", reranked: false, fallback: null, cached: false };
 
   const mode = opts.mode || config.retrieval.mode;
   const topK = Math.min(50, Math.max(1, opts.topK ?? config.retrieval.topK));
   const candidateK = Math.max(topK, opts.candidateK ?? config.retrieval.candidateK);
+  const doRerank = opts.rerank ?? config.retrieval.rerank;
+  const filters = opts.filters || null;
 
-  let rows;
-  let usedMode = mode;
-  if (mode === "lexical") {
-    rows = await lexicalSearch({ queryText: q, topK });
-  } else if (mode === "vector") {
-    const queryEmbedding = await embed(q);
-    rows = await vectorSearch({ queryEmbedding, topK });
-  } else {
-    const queryEmbedding = await embed(q);
-    rows = await hybridSearch({
-      queryEmbedding,
-      queryText: q,
-      candidateK,
-      topK,
-      rrfK: config.retrieval.rrfK,
-    });
-    if (!rows.length) {
-      // Lexical query may have been empty (stop-words only) or matched nothing.
-      // Fall back to pure vector search to guarantee a non-empty result set
-      // when any chunks exist.
-      log.debug({ q }, "hybrid returned 0; falling back to vector");
-      rows = await vectorSearch({ queryEmbedding, topK });
-      usedMode = "vector";
+  // Cache check
+  const key = cacheKey({ q, mode, topK, candidateK, doRerank, filters });
+  if (cache) {
+    const hit = cache.get(key);
+    if (hit) {
+      log.debug({ q: q.slice(0, 80) }, "retrieval cache hit");
+      return { ...hit, cached: true };
     }
   }
 
-  return {
+  let rows;
+  let usedMode = mode;
+  let fallback = null;
+
+  if (mode === "lexical") {
+    rows = await lexicalSearch({ qt: q, candidateK, filters });
+  } else if (mode === "vector") {
+    const qv = toVectorLiteral(await embed(q, "query"));
+    rows = await vectorSearch({ qv, candidateK, filters });
+  } else {
+    // hybrid
+    const qv = toVectorLiteral(await embed(q, "query"));
+    rows = await hybridSearch({
+      qv,
+      qt: q,
+      candidateK,
+      rrfK: config.retrieval.rrfK,
+      filters,
+    });
+    if (!rows.length) {
+      // Lexical query may have been empty (stop-words only) or matched
+      // nothing under the current filters. Fall back to pure vector.
+      log.info({ q: q.slice(0, 80) }, "hybrid empty -> falling back to vector");
+      rows = await vectorSearch({ qv, candidateK, filters });
+      usedMode = "vector";
+      fallback = "lexical-empty";
+    }
+  }
+
+  // Rerank step: cross-encoder over the candidate set. Skipped when no
+  // candidates or when explicitly disabled. Voyage rerank-2.5 scores
+  // (query, document) pairs natively without needing query embeddings.
+  let reranked = false;
+  if (doRerank && rows.length > 1) {
+    try {
+      const scored = await rerank({
+        query: q,
+        documents: rows.map((r) => r.content),
+        topK: topK,
+        model: config.voyage.rerankModel,
+      });
+      // Reorder rows by rerank result; attach scores.
+      const reordered = scored.map((s) => ({
+        ...rows[s.index],
+        rerank_score: s.score,
+      }));
+      rows = reordered;
+      reranked = true;
+    } catch (err) {
+      log.warn({ err: err.message }, "rerank failed; falling back to RRF order");
+      rows = rows.slice(0, topK);
+    }
+  } else {
+    rows = rows.slice(0, topK);
+  }
+
+  const result = {
     sources: shapeRows(rows),
     mode: usedMode,
+    reranked,
+    fallback,
+    cached: false,
   };
+
+  if (cache) cache.set(key, result);
+
+  return result;
 }
 
 module.exports = {
   retrieve,
   parseMetadata,
+  // Exported for tests / debugging
+  buildFilterClause,
 };

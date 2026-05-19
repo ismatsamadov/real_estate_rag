@@ -2,23 +2,29 @@
 "use strict";
 
 /**
- * Sitemap-driven scraper.
+ * Full-site scraper.
  *
- *   1. Walks the configured sitemap (handling sitemap-index nesting).
- *   2. Scrapes each URL via Firecrawl with bounded concurrency and
- *      exponential-backoff retries.
- *   3. Streams JSONL records to disk and atomically renames at the end so
- *      a crash mid-run never leaves a half-written corpus.
+ *   1. DISCOVER URLs via Firecrawl's map endpoint (sitemap + crawl-based
+ *      discovery). This catches pages the sitemap misses — paginated
+ *      listings, deep links from category pages, JS-rendered routes, etc.
+ *   2. CLASSIFY each URL as `listing` | `article` | `static` and tag the
+ *      detected language (en | az | ru) from the URL path.
+ *   3. SCRAPE in batches via Firecrawl with JS render + onlyMainContent so
+ *      we get clean Markdown without nav/footer noise.
+ *   4. Stream JSONL to disk, atomic rename at end.
+ *
+ * Flags:
+ *   --urls-only          Discover + classify only; no scraping (debug)
+ *   --limit <N>          Cap total URLs after classification
+ *   --include-types a,b  Keep only these doc_types (e.g. listing,article)
+ *   --languages a,b      Override SCRAPE_LANGUAGES env
  */
 
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
-const http = require("node:http");
-const https = require("node:https");
-
+const crypto = require("node:crypto");
 const FirecrawlApp = require("@mendable/firecrawl-js").default;
-const { XMLParser } = require("fast-xml-parser");
 
 const config = require("../src/config");
 const logger = require("../src/logger");
@@ -30,190 +36,286 @@ if (!config.firecrawl.apiKey) {
   process.exit(1);
 }
 
-function fetchText(targetUrl, redirectCount = 0) {
-  return new Promise((resolve, reject) => {
-    if (redirectCount > 5) return reject(new Error(`Too many redirects: ${targetUrl}`));
-    let parsed;
-    try {
-      parsed = new URL(targetUrl);
-    } catch {
-      return reject(new Error(`Invalid URL: ${targetUrl}`));
-    }
-    const isHttps = parsed.protocol === "https:";
-    const client = isHttps ? https : http;
-    const req = client.request(
-      parsed,
-      {
-        method: "GET",
-        headers: { "User-Agent": "real-estate-rag-scraper/1.0" },
-        timeout: 20_000,
-        family: 4,
-        rejectUnauthorized: isHttps ? !config.scrape.allowInsecureTls : undefined,
-      },
-      (res) => {
-        const status = res.statusCode || 0;
-        if ([301, 302, 303, 307, 308].includes(status) && res.headers.location) {
-          const next = new URL(res.headers.location, parsed).toString();
-          res.resume();
-          fetchText(next, redirectCount + 1).then(resolve).catch(reject);
-          return;
-        }
-        if (status < 200 || status >= 300) {
-          res.resume();
-          return reject(new Error(`HTTP ${status} for ${targetUrl}`));
-        }
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error(`Timeout: ${targetUrl}`)));
-    req.on("error", (err) => reject(new Error(`Request failed for ${targetUrl}: ${err.message}`)));
-    req.end();
+// ----------------------------------------------------------------------------
+// URL classification
+// ----------------------------------------------------------------------------
+
+// Patterns reflect the actual URL structure observed on pasharealestate.az:
+//   /units/<slug>          individual unit listings (EN)
+//   /menziller/<slug>      individual unit listings (AZ; "menziller" = apartments)
+//   /kvartiry/<slug>       individual unit listings (RU)
+//   /portfolio/<slug>      development/project pages (treated as listings —
+//                          they carry pricing + amenity facts that retrieval
+//                          should ground answers on)
+const LISTING_PATTERNS = [
+  /\/(property|properties|listing|listings|estate|estates|object|objects)\b/i,
+  /\/(units|menziller|portfolio)\//i, // pasharealestate.az specific (EN/AZ)
+  /\/(elan|elanlar|obyekt|obyektler)\b/i, // generic Azerbaijani
+  /\/(obyavlen|nedvizhimost|kvartir)\w*/i, // Russian
+  /-\d{3,}$/, // slug ending in long numeric ID (PRE unit IDs)
+  /\/\d{4,}(?:[/?]|$)/, // numeric ID segment
+];
+
+const ARTICLE_PATTERNS = [
+  /\/(news|blog|article|articles|post|posts|insights|guide|guides|press)\b/i,
+  /\/(xeber|xeberler|meqale)\b/i, // Azerbaijani
+  /\/(novost|stat)\w*/i, // Russian
+];
+
+const LANGUAGE_PREFIX_RE = /^\/(en|az|ru|tr)(?:\/|$)/i;
+
+const EXCLUDE_PATTERNS = [
+  /\/(login|signin|signup|register|account|cart|checkout|wp-admin|admin)\b/i,
+  /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|mp4|css|js|xml|txt|json|ico|woff2?|ttf|eot)(\?|$)/i,
+  /\/(sitemap|robots|feed|rss|atom)(\.|$)/i,
+  /^mailto:/i,
+  /^tel:/i,
+  /^javascript:/i,
+];
+
+function classifyUrl(rawUrl, baseUrl) {
+  let u;
+  try {
+    u = new URL(rawUrl, baseUrl);
+  } catch {
+    return null;
+  }
+  if (EXCLUDE_PATTERNS.some((re) => re.test(u.href))) return null;
+  // Same-origin only.
+  if (new URL(baseUrl).hostname !== u.hostname) return null;
+
+  const pathname = u.pathname || "/";
+  const langMatch = pathname.match(LANGUAGE_PREFIX_RE);
+  const language = langMatch ? langMatch[1].toLowerCase() : "en";
+
+  let docType = "static";
+  if (LISTING_PATTERNS.some((re) => re.test(pathname))) docType = "listing";
+  else if (ARTICLE_PATTERNS.some((re) => re.test(pathname))) docType = "article";
+
+  return {
+    url: u.href,
+    pathname,
+    language,
+    docType,
+  };
+}
+
+// ----------------------------------------------------------------------------
+// Discovery
+// ----------------------------------------------------------------------------
+
+async function discoverUrls(app, baseUrl) {
+  // Firecrawl's map endpoint returns the union of sitemap URLs and
+  // crawl-discovered URLs. useIndex=true lets it use cached site indexes
+  // for speed; includeSubdomains=true catches subdomain variants.
+  log.info({ baseUrl }, "discovering URLs via Firecrawl map");
+  const res = await app.mapUrl(baseUrl, {
+    includeSubdomains: false,
+    sitemapOnly: false,
+    useIndex: true,
+    limit: config.scrape.maxPages * 2, // overfetch; we'll filter below
   });
-}
-
-async function collectUrls(sitemapUrl, parser, seen = new Set()) {
-  if (!sitemapUrl || seen.has(sitemapUrl)) return [];
-  seen.add(sitemapUrl);
-  const xml = await fetchText(sitemapUrl);
-  const parsed = parser.parse(xml);
-
-  if (parsed?.urlset?.url) {
-    const nodes = Array.isArray(parsed.urlset.url) ? parsed.urlset.url : [parsed.urlset.url];
-    return nodes.map((n) => n?.loc).filter(Boolean);
+  if (!res?.success) {
+    throw new Error(`Firecrawl map failed: ${res?.error || "unknown"}`);
   }
-  if (parsed?.sitemapindex?.sitemap) {
-    const sitemaps = Array.isArray(parsed.sitemapindex.sitemap)
-      ? parsed.sitemapindex.sitemap
-      : [parsed.sitemapindex.sitemap];
-    const nested = await Promise.all(
-      sitemaps.map((s) => collectUrls(s?.loc, parser, seen))
-    );
-    return nested.flat();
+  const links = res.links || [];
+  log.info({ found: links.length }, "raw URLs discovered");
+  return links;
+}
+
+// ----------------------------------------------------------------------------
+// Scraping
+// ----------------------------------------------------------------------------
+
+async function batchScrape(app, urls) {
+  // batchScrapeUrls polls until all done. We use markdown + html so the
+  // chunker can fall back to HTML for structured tables. onlyMainContent
+  // strips nav/footer/cookies. waitFor gives JS-heavy listing pages time
+  // to hydrate.
+  log.info({ count: urls.length }, "batch scraping");
+  const res = await app.batchScrapeUrls(
+    urls,
+    {
+      formats: ["markdown", "html"],
+      onlyMainContent: true,
+      waitFor: 1500,
+      timeout: 30_000,
+      blockAds: true,
+    },
+    /* pollInterval */ 5,
+    /* idempotencyKey */ undefined,
+    /* webhook */ undefined,
+    /* ignoreInvalidURLs */ true,
+    /* maxConcurrency */ config.scrape.concurrency,
+  );
+  if (!res?.success && res?.status !== "completed") {
+    throw new Error(`Batch scrape failed: ${res?.error || JSON.stringify(res).slice(0, 200)}`);
   }
-  return [];
+  return res.data || [];
 }
 
-function toBase64Url(input) {
-  return Buffer.from(input, "utf8")
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+// ----------------------------------------------------------------------------
+// Output helpers
+// ----------------------------------------------------------------------------
+
+function urlToDocId(url) {
+  // Stable, filesystem-safe ID derived from URL hash.
+  return crypto.createHash("sha1").update(url).digest("hex").slice(0, 16);
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function pickTitle(metadata, markdown) {
+  if (metadata?.title) return String(metadata.title).trim();
+  if (metadata?.ogTitle) return String(metadata.ogTitle).trim();
+  // Fallback: first non-empty H1 in markdown.
+  const m = String(markdown || "").match(/^#\s+(.+)$/m);
+  return m ? m[1].trim() : null;
 }
 
-async function scrapeWithRetry(app, url) {
-  let attempt = 0;
-  let lastError;
-  while (attempt <= config.scrape.retryMax) {
-    try {
-      const result = await app.scrapeUrl(url, { formats: ["markdown"] });
-      return result;
-    } catch (err) {
-      lastError = err;
-      attempt += 1;
-      if (attempt > config.scrape.retryMax) break;
-      const backoff = Math.min(30_000, 2 ** attempt * 500 + Math.random() * 250);
-      log.warn(
-        { url, attempt, backoff, err: err.message },
-        "scrape failed, retrying"
-      );
-      await sleep(backoff);
-    }
+// ----------------------------------------------------------------------------
+// CLI parsing
+// ----------------------------------------------------------------------------
+
+function parseArgs(argv) {
+  const args = { urlsOnly: false, limit: null, includeTypes: null, languages: null };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--urls-only") args.urlsOnly = true;
+    else if (a === "--limit") args.limit = parseInt(argv[++i], 10);
+    else if (a === "--include-types") args.includeTypes = argv[++i].split(",");
+    else if (a === "--languages") args.languages = argv[++i].split(",");
   }
-  throw lastError;
+  return args;
 }
 
-async function runWithConcurrency(items, worker, concurrency) {
-  let cursor = 0;
-  let inflight = 0;
-  return new Promise((resolve, reject) => {
-    const next = () => {
-      if (cursor >= items.length && inflight === 0) return resolve();
-      while (inflight < concurrency && cursor < items.length) {
-        const idx = cursor++;
-        inflight += 1;
-        Promise.resolve()
-          .then(() => worker(items[idx], idx))
-          .catch(reject)
-          .finally(() => {
-            inflight -= 1;
-            next();
-          });
-      }
-    };
-    next();
-  });
-}
+// ----------------------------------------------------------------------------
+// Main
+// ----------------------------------------------------------------------------
 
 async function main() {
-  if (config.scrape.allowInsecureTls) {
-    log.warn("ALLOW_INSECURE_SITEMAP_TLS=1, sitemap TLS validation disabled");
+  const args = parseArgs(process.argv.slice(2));
+  const app = new FirecrawlApp({ apiKey: config.firecrawl.apiKey });
+  const baseUrl = config.scrape.baseUrl;
+  const languages = new Set((args.languages || config.scrape.languages).map((l) => l.toLowerCase()));
+  const includeTypes = args.includeTypes ? new Set(args.includeTypes) : null;
+
+  // 1. Discover
+  const rawUrls = await discoverUrls(app, baseUrl);
+
+  // 2. Classify + filter
+  const classified = [];
+  const stats = { total: 0, excluded: 0, byLang: {}, byType: {} };
+  for (const raw of rawUrls) {
+    stats.total += 1;
+    const c = classifyUrl(raw, baseUrl);
+    if (!c) {
+      stats.excluded += 1;
+      continue;
+    }
+    if (!languages.has(c.language)) {
+      stats.excluded += 1;
+      continue;
+    }
+    if (includeTypes && !includeTypes.has(c.docType)) {
+      stats.excluded += 1;
+      continue;
+    }
+    classified.push(c);
+    stats.byLang[c.language] = (stats.byLang[c.language] || 0) + 1;
+    stats.byType[c.docType] = (stats.byType[c.docType] || 0) + 1;
   }
 
-  const parser = new XMLParser();
-  const app = new FirecrawlApp({ apiKey: config.firecrawl.apiKey });
+  // De-dupe (Firecrawl can return duplicates with/without trailing slash).
+  const seen = new Set();
+  const deduped = classified.filter((c) => {
+    const key = c.url.replace(/\/$/, "");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 
-  log.info({ sitemap: config.scrape.sitemapUrl }, "collecting sitemap URLs");
-  const urls = [...new Set(await collectUrls(config.scrape.sitemapUrl, parser))];
-  log.info({ count: urls.length }, "URLs collected");
+  const max = args.limit ?? config.scrape.maxPages;
+  const final = deduped.slice(0, max);
+
+  log.info(
+    { discovered: stats.total, kept: final.length, excluded: stats.excluded, byLang: stats.byLang, byType: stats.byType },
+    "classification complete",
+  );
+
+  if (args.urlsOnly) {
+    const out = path.resolve(config.paths.repoRoot, "data/urls.json");
+    await fsp.mkdir(path.dirname(out), { recursive: true });
+    await fsp.writeFile(out, JSON.stringify(final, null, 2));
+    log.info({ output: out, count: final.length }, "URLs written (--urls-only)");
+    return;
+  }
+
+  // 3. Batch scrape
+  const urlList = final.map((c) => c.url);
+  const classByUrl = new Map(final.map((c) => [c.url, c]));
 
   const outFinal = config.paths.outputJsonl;
-  const outDir = path.dirname(outFinal);
-  await fsp.mkdir(outDir, { recursive: true });
+  await fsp.mkdir(path.dirname(outFinal), { recursive: true });
   const outTmp = `${outFinal}.${process.pid}.tmp`;
   const writer = fs.createWriteStream(outTmp, { encoding: "utf8" });
 
-  let ok = 0;
-  let skipped = 0;
-  let failed = 0;
-  let processed = 0;
+  // Process in chunks of 100 to keep batch-scrape responses manageable.
+  const CHUNK = 100;
+  let ok = 0, empty = 0, failed = 0;
 
-  const writeRecord = (record) =>
-    new Promise((resolve, reject) => {
-      writer.write(`${JSON.stringify(record)}\n`, (err) => (err ? reject(err) : resolve()));
-    });
+  for (let i = 0; i < urlList.length; i += CHUNK) {
+    const slice = urlList.slice(i, i + CHUNK);
+    log.info({ from: i, to: i + slice.length, total: urlList.length }, "batch slice");
+    let data;
+    try {
+      data = await batchScrape(app, slice);
+    } catch (err) {
+      failed += slice.length;
+      log.error({ err: err.message, from: i, count: slice.length }, "batch failed");
+      continue;
+    }
 
-  const total = urls.length;
-  await runWithConcurrency(
-    urls,
-    async (url) => {
-      processed += 1;
-      try {
-        const result = await scrapeWithRetry(app, url);
-        const markdown =
-          result?.data?.markdown || result?.markdown || "";
-        const metadata = result?.data?.metadata || result?.metadata || {};
-        if (!String(markdown).trim()) {
-          skipped += 1;
-          log.debug({ url, processed, total }, "skip (empty)");
-          return;
-        }
-        await writeRecord({
-          id: toBase64Url(url),
-          url,
-          text: markdown,
-          metadata,
-        });
-        ok += 1;
-        log.info({ url, processed, total }, "scraped");
-      } catch (err) {
-        failed += 1;
-        log.warn({ url, err: err.message }, "scrape failed permanently");
+    for (const item of data) {
+      // Firecrawl returns items shaped differently across versions; defensive.
+      const url = item?.metadata?.sourceURL || item?.url || item?.metadata?.url;
+      const markdown = item?.markdown || item?.data?.markdown || "";
+      const html = item?.html || item?.data?.html || "";
+      const meta = item?.metadata || item?.data?.metadata || {};
+      if (!url) {
+        empty += 1;
+        continue;
       }
-    },
-    config.scrape.concurrency
-  );
+      const cls = classByUrl.get(url) || classifyUrl(url, baseUrl);
+      if (!cls) {
+        empty += 1;
+        continue;
+      }
+      if (!String(markdown).trim()) {
+        empty += 1;
+        log.debug({ url }, "skip empty");
+        continue;
+      }
+      const record = {
+        doc_id: urlToDocId(url),
+        url,
+        title: pickTitle(meta, markdown),
+        language: cls.language,
+        doc_type: cls.docType,
+        markdown,
+        html,
+        source_metadata: meta,
+        scraped_at: new Date().toISOString(),
+      };
+      await new Promise((resolve, reject) =>
+        writer.write(`${JSON.stringify(record)}\n`, (err) => (err ? reject(err) : resolve())),
+      );
+      ok += 1;
+    }
+  }
 
   await new Promise((resolve, reject) => writer.end((err) => (err ? reject(err) : resolve())));
   await fsp.rename(outTmp, outFinal);
 
-  log.info({ ok, skipped, failed, total: urls.length, output: outFinal }, "scrape complete");
+  log.info({ ok, empty, failed, output: outFinal }, "scrape complete");
 }
 
 main().catch((err) => {

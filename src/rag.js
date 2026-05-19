@@ -27,7 +27,7 @@ async function ask(question, options = {}) {
   if (!q) throw new Error("Question is empty.");
   const t0 = Date.now();
 
-  const { sources, mode } = await retrieve(q, options);
+  const { sources, mode, reranked, fallback, cached } = await retrieve(q, options);
   if (!sources.length) return { ...noContextAnswer(), topK: options.topK ?? config.retrieval.topK };
 
   const { system, messages } = buildMessages(q, sources);
@@ -42,11 +42,14 @@ async function ask(question, options = {}) {
     {
       ms: Date.now() - t0,
       mode,
+      reranked,
+      fallback,
+      cached,
       sources: sources.length,
       model: completion.model,
       usage: completion.usage,
     },
-    "ask complete"
+    "ask complete",
   );
 
   return {
@@ -56,6 +59,9 @@ async function ask(question, options = {}) {
     usage: completion.usage,
     stop_reason: completion.stop_reason,
     mode,
+    reranked,
+    fallback,
+    cached,
     topK: options.topK ?? config.retrieval.topK,
   };
 }
@@ -83,8 +89,16 @@ async function* askStream(question, options = {}) {
     return;
   }
 
-  const { sources, mode } = retrieved;
-  yield { type: "sources", sources, mode, topK: options.topK ?? config.retrieval.topK };
+  const { sources, mode, reranked, fallback, cached } = retrieved;
+  yield {
+    type: "sources",
+    sources,
+    mode,
+    reranked,
+    fallback,
+    cached,
+    topK: options.topK ?? config.retrieval.topK,
+  };
 
   if (!sources.length) {
     yield { type: "delta", text: noContextAnswer().answer };

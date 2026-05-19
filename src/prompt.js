@@ -26,11 +26,12 @@ const SYSTEM_PROMPT = [
   "4. Do not use outside knowledge. If a fact is not in the sources, do not claim it.",
   "5. If a source's extracted_facts (price, bedrooms, area) contradicts its body text, prefer the body text and note the discrepancy.",
   "",
-  "MEMORY vs SOURCES (do not confuse these):",
+  "MEMORY vs SOURCES vs USER PROFILE (do not confuse these):",
   "- [Sn] markers refer to RETRIEVED CORPUS SOURCES for the current turn. Every factual claim cites [Sn].",
   "- [Mn] markers (if present) are RECALLED MEMORIES from this user's prior sessions. They are continuity context only — you may say \"earlier you asked about X\" or \"as we discussed before\", but NEVER cite [Mn] as evidence for a fact. Facts must still cite [Sn].",
-  "- If a memory contradicts the current sources, the sources win.",
-  "- If the user asks \"what did we talk about?\" or \"remember when…\", you may summarize from [Mn] without citing [Sn].",
+  "- USER PROFILE block (if present) summarizes this user's standing intent — saved listings, recent topics, uploaded documents, and an inferred summary. It is PERSONALIZATION CONTEXT — proactively reference it when relevant (\"since you saved Knightsbridge 2BR…\", \"matching your 2-bedroom focus…\") but NEVER cite it as evidence for a fact. Facts must still cite [Sn].",
+  "- If memory or profile contradicts the current sources, the sources win.",
+  "- If the user asks \"what did we talk about?\" / \"what am I looking for?\" / \"remember when…\", you may summarize from [Mn] and the profile without [Sn] citations.",
   "",
   "ROOM TERMINOLOGY (CRITICAL — read carefully, this trips up most assistants):",
   "- AZ \"otaqlı\" and RU \"комнатная\" mean TOTAL rooms (living room counted).",
@@ -103,6 +104,50 @@ function buildMemoriesBlock(memories) {
 }
 
 /**
+ * The standing intent profile. Read every turn, injected above sources.
+ * Compact by design (capped at ~12 favorites + ~5 topics + ~5 uploads).
+ * Returns an empty string if there is nothing to say about the user.
+ */
+function buildUserProfileBlock(userContext) {
+  if (!userContext) return "";
+  const { summary, favorites, recentTopics, uploads, counts } = userContext;
+  if (!summary && !favorites?.length && !recentTopics?.length && !uploads?.length) {
+    return "";
+  }
+  const lines = [
+    "USER PROFILE (personalization context — proactively reference when relevant; NOT citable as a factual source):",
+  ];
+  if (summary) {
+    lines.push(`Intent: ${summary}`);
+  }
+  if (favorites?.length) {
+    lines.push(
+      `Saved listings (${counts?.favorite_n ?? favorites.length}): ` +
+        favorites
+          .slice(0, 12)
+          .map((f) => f.title)
+          .join(" · "),
+    );
+  }
+  if (recentTopics?.length) {
+    lines.push("Recent topics:");
+    for (const q of recentTopics.slice(0, 5)) {
+      lines.push(`  - ${q.slice(0, 140)}`);
+    }
+  }
+  if (uploads?.length) {
+    lines.push(
+      `Uploaded docs: ` +
+        uploads
+          .slice(0, 5)
+          .map((u) => (u.total_pages ? `${u.title} (${u.total_pages}p)` : u.title))
+          .join(" · "),
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
  * Build messages for Anthropic. System block is cached; user message
  * carries the question + sources + optional memories.
  *
@@ -120,10 +165,20 @@ function buildMemoriesBlock(memories) {
  * just-retrieved sources, so each generation is grounded against fresh
  * retrieval rather than stale chunks from older turns.
  */
-function buildMessages(question, sources, { history, memories } = {}) {
+function buildMessages(question, sources, { history, memories, userContext } = {}) {
   const sourcesBlock = buildSourcesBlock(sources);
   const memoriesBlock = buildMemoriesBlock(memories);
+  const profileBlock = buildUserProfileBlock(userContext);
+  // Order in the user message:
+  //   1. user profile (who they are)
+  //   2. recalled memories (what they discussed before)
+  //   3. current question
+  //   4. retrieved sources for this turn
+  // Profile first means the model frames the question against the user's
+  // standing intent before reading the sources.
   const userText = [
+    profileBlock,
+    profileBlock ? "" : null,
     memoriesBlock,
     memoriesBlock ? "" : null,
     `Question: ${question}`,

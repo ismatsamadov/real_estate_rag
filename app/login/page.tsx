@@ -12,7 +12,7 @@ export default async function LoginPage({
   const params = await searchParams;
   const next = params?.next || "/";
   return (
-    <main className="min-h-screen relative overflow-hidden">
+    <main className="min-h-[100svh] relative overflow-hidden">
       {/* Background — layered radial gradients give a quiet, premium feel */}
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_10%_10%,rgba(200,145,72,0.18),transparent_55%),radial-gradient(circle_at_90%_90%,rgba(10,10,10,0.08),transparent_60%)] bg-zinc-50" />
       <div className="absolute inset-0 [mask-image:linear-gradient(180deg,black,transparent_80%)] opacity-30"
@@ -53,13 +53,13 @@ export default async function LoginPage({
         </aside>
 
         {/* Right: form */}
-        <section className="flex items-center justify-center p-6 sm:p-12">
+        <section className="flex items-center justify-center safe-px p-4 sm:p-6 lg:p-12 safe-pb">
           <div className="w-full max-w-md">
             <div className="lg:hidden mb-8 flex items-center gap-3 text-sm">
               <span className="inline-block w-2 h-2 rounded-full bg-brand-500" />
               <span className="tracking-[0.2em] uppercase text-ink-muted">PASHA Real Estate</span>
             </div>
-            <div className="bg-white/70 backdrop-blur-md border border-zinc-200/70 rounded-2xl shadow-[0_1px_2px_rgba(0,0,0,0.04),0_8px_24px_-12px_rgba(0,0,0,0.12)] p-7 sm:p-9">
+            <div className="bg-white/70 backdrop-blur-md border border-zinc-200/70 rounded-2xl shadow-[0_1px_2px_rgba(0,0,0,0.04),0_8px_24px_-12px_rgba(0,0,0,0.12)] p-5 sm:p-7 lg:p-9">
               <h2 className="font-display text-3xl mb-1">Welcome back</h2>
               <p className="text-sm text-ink-muted mb-7">
                 Sign in to continue.

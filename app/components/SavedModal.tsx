@@ -39,7 +39,7 @@ export default function SavedModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start sm:items-center justify-center p-2 sm:p-6"
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center sm:p-6"
       onClick={onClose}
       role="dialog"
       aria-modal="true"
@@ -47,7 +47,9 @@ export default function SavedModal({
     >
       <div className="absolute inset-0 bg-ink/40 backdrop-blur-sm" />
       <div
-        className="relative w-full max-w-2xl max-h-[90vh] flex flex-col bg-white rounded-2xl shadow-2xl border border-zinc-200 overflow-hidden"
+        className="relative w-full max-w-2xl flex flex-col bg-white shadow-2xl border-t sm:border border-zinc-200 overflow-hidden
+                   rounded-t-2xl sm:rounded-2xl
+                   h-[88svh] sm:h-auto sm:max-h-[88vh]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -64,7 +66,7 @@ export default function SavedModal({
           <button
             onClick={onClose}
             aria-label="Close"
-            className="w-8 h-8 inline-flex items-center justify-center rounded-lg text-ink-muted hover:text-ink hover:bg-zinc-100 transition-colors"
+            className="w-11 h-11 sm:w-8 sm:h-8 inline-flex items-center justify-center rounded-lg text-ink-muted hover:text-ink hover:bg-zinc-100 transition-colors -mr-2 sm:mr-0"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" aria-hidden>
               <path d="M6 6l12 12M18 6L6 18" strokeLinecap="round" strokeLinejoin="round" />
@@ -104,7 +106,7 @@ export default function SavedModal({
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-zinc-200 text-[0.7rem] text-ink-muted">
+        <div className="px-5 py-3 border-t border-zinc-200 text-[0.7rem] text-ink-muted safe-pb">
           Saved listings live in <span className="font-mono">favorites</span> table in Neon — one row per (user, doc_id).
         </div>
       </div>

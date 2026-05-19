@@ -20,6 +20,7 @@ import { getUserId } from "../../_auth";
 import { askStream } from "../../../../src/rag";
 import sessions from "../../../../src/sessions";
 import memory from "../../../../src/memory";
+import { classifyError } from "../../../../src/errors";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -169,7 +170,18 @@ export async function POST(request: Request) {
         }
         send({ type: "end" });
       } catch (err: any) {
-        send({ type: "error", error: err?.message || "Internal error." });
+        // Use the pre-attached classification if the LLM layer set it,
+        // otherwise classify here. Falls back gracefully for any error
+        // source (Postgres, Voyage, network).
+        const cls = err?.classified || classifyError(err);
+        console.warn("ask/stream error:", cls.kind, cls.devMessage);
+        send({
+          type: "error",
+          kind: cls.kind,
+          error: cls.userMessage,
+          retryable: cls.retryable,
+          status: cls.status,
+        });
       } finally {
         clearInterval(heartbeat);
 

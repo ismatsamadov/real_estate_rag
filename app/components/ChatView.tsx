@@ -12,6 +12,13 @@ type MemoryChip = {
   similarity: number;
 };
 
+type ChatError = {
+  kind: string;
+  message: string;
+  retryable: boolean;
+  status: number | null;
+};
+
 type ChatMessage = {
   id?: number | string;
   role: "user" | "assistant";
@@ -22,6 +29,7 @@ type ChatMessage = {
   retrieval?: any;
   rewritten?: { original: string; rewritten: string } | null;
   memories?: MemoryChip[] | null;
+  error?: ChatError | null;
 };
 
 const EXAMPLES = [
@@ -47,12 +55,34 @@ export default function ChatView({
   const threadRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // Uploaded documents for this session.
+  type UploadedDoc = {
+    doc_id: string;
+    title: string;
+    total_pages?: number | null;
+    chunk_count?: number | null;
+    size_kb?: number | null;
+    uploading?: boolean;
+    error?: string | null;
+  };
+  const [uploadedDocs, setUploadedDocs] = useState<UploadedDoc[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   // Load history when sessionId changes.
   useEffect(() => {
     if (!sessionId) {
       setMessages([]);
+      setUploadedDocs([]);
       return;
     }
+    // Also pull any uploaded documents already attached to this session
+    // (e.g. after a reload).
+    fetch(`/api/documents?sessionId=${sessionId}`, { credentials: "include" })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.ok && Array.isArray(d.documents)) setUploadedDocs(d.documents);
+      })
+      .catch(() => {});
     let cancelled = false;
     setLoadingHistory(true);
     (async () => {
@@ -198,8 +228,13 @@ export default function ChatView({
             } else if (event.type === "error") {
               setMessages((prev) => updateLast(prev, (m) => ({
                 ...m,
-                content: m.content + `\n\n_Error: ${event.error}_`,
                 streaming: false,
+                error: {
+                  kind: event.kind || "unknown",
+                  message: event.error || "Something went wrong.",
+                  retryable: Boolean(event.retryable),
+                  status: event.status ?? null,
+                },
               })));
             }
           }
@@ -207,16 +242,22 @@ export default function ChatView({
 
         if (createdSession) onSessionCreated(createdSession);
       } catch (err: any) {
-        if (err?.name !== "AbortError") {
+        if (err?.name === "AbortError") {
           setMessages((prev) => updateLast(prev, (m) => ({
             ...m,
-            content: m.content || `_Error: ${err?.message || "request failed"}_`,
             streaming: false,
           })));
         } else {
+          // Client-side network failure before any SSE event arrived.
           setMessages((prev) => updateLast(prev, (m) => ({
             ...m,
             streaming: false,
+            error: {
+              kind: "network",
+              message: "Couldn't reach the server. Check your connection and try again.",
+              retryable: true,
+              status: null,
+            },
           })));
         }
       } finally {
@@ -229,10 +270,89 @@ export default function ChatView({
 
   const cancel = () => abortRef.current?.abort();
 
+  // -------------- Document upload --------------
+  const uploadFile = useCallback(
+    async (file: File) => {
+      // Optimistic placeholder so the chip shows a "uploading…" state.
+      const placeholderId = `pending-${Date.now()}`;
+      const placeholder: UploadedDoc = {
+        doc_id: placeholderId,
+        title: file.name,
+        uploading: true,
+      };
+      setUploadedDocs((prev) => [placeholder, ...prev]);
+
+      const form = new FormData();
+      form.append("file", file);
+      if (sessionId) form.append("sessionId", sessionId);
+
+      try {
+        const resp = await fetch("/api/documents", {
+          method: "POST",
+          body: form,
+          credentials: "include",
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data?.ok) {
+          throw new Error(data?.error || `Upload failed (HTTP ${resp.status})`);
+        }
+        // If the server auto-created the session for us, propagate that.
+        if (!sessionId && data.sessionId) {
+          onSessionCreated(data.sessionId);
+        }
+        // Replace the placeholder with the canonical row from the server.
+        setUploadedDocs((prev) =>
+          prev.map((d) =>
+            d.doc_id === placeholderId
+              ? {
+                  doc_id: data.document.docId,
+                  title: data.document.title,
+                  total_pages: data.document.totalPages,
+                  chunk_count: data.document.totalChunks,
+                  size_kb: data.document.sizeKb,
+                }
+              : d,
+          ),
+        );
+      } catch (err: any) {
+        setUploadedDocs((prev) =>
+          prev.map((d) =>
+            d.doc_id === placeholderId
+              ? { ...d, uploading: false, error: err?.message || "Upload failed" }
+              : d,
+          ),
+        );
+        // Auto-remove the failed chip after a few seconds.
+        setTimeout(() => {
+          setUploadedDocs((prev) => prev.filter((d) => d.doc_id !== placeholderId));
+        }, 6000);
+      }
+    },
+    [sessionId, onSessionCreated],
+  );
+
+  const removeUpload = useCallback(
+    async (docId: string) => {
+      if (!sessionId) return;
+      setUploadedDocs((prev) => prev.filter((d) => d.doc_id !== docId));
+      try {
+        await fetch(
+          `/api/documents/${encodeURIComponent(docId)}?sessionId=${sessionId}`,
+          { method: "DELETE", credentials: "include" },
+        );
+      } catch {
+        // best-effort
+      }
+    },
+    [sessionId],
+  );
+
   const isEmpty = messages.length === 0 && !loadingHistory;
 
   return (
-    <div className="relative flex flex-col h-[calc(100dvh-3.5rem)] sm:h-[calc(100dvh-4rem)]">
+    <div className="relative flex flex-col h-[calc(100svh-3.5rem)] sm:h-[calc(100svh-4rem)]">
+      {/* svh (small viewport height) so iOS Safari's collapsible URL bar
+          doesn't push the composer out of view. */}
       {/* Thread */}
       <div ref={threadRef} className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-3xl px-4 sm:px-6 py-6 lg:py-10">
@@ -256,15 +376,33 @@ export default function ChatView({
                 msg={m}
                 activeSid={activeSid}
                 setActiveSid={setActiveSid}
+                onRetry={() => {
+                  // Find the user message immediately preceding this assistant block.
+                  const prev = messages[i - 1];
+                  if (prev && prev.role === "user") submit(prev.content);
+                }}
               />
             ),
           )}
         </div>
       </div>
 
-      {/* Composer */}
+      {/* Composer — sticks to bottom; safe-pb respects iPhone home bar. */}
       <div className="border-t border-zinc-200/70 bg-white/80 backdrop-blur-md">
-        <div className="mx-auto max-w-3xl px-4 sm:px-6 py-3">
+        <div className="mx-auto max-w-3xl px-3 sm:px-6 py-2 sm:py-3 safe-pb">
+          {/* Uploaded-doc chips */}
+          {uploadedDocs.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {uploadedDocs.map((d) => (
+                <UploadedDocChip
+                  key={d.doc_id}
+                  doc={d}
+                  onRemove={() => removeUpload(d.doc_id)}
+                />
+              ))}
+            </div>
+          )}
+
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -272,6 +410,32 @@ export default function ChatView({
             }}
             className="flex items-end gap-2"
           >
+            {/* Hidden file input + paperclip trigger */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf,.pdf"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) uploadFile(f);
+                // Reset so picking the same file twice still fires onChange.
+                if (e.target) e.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={streaming}
+              aria-label="Upload PDF"
+              title="Upload a PDF to ask questions about it"
+              className="flex-none w-11 h-11 sm:w-12 sm:h-12 inline-flex items-center justify-center rounded-xl border border-zinc-200 bg-white/70 hover:bg-white hover:border-brand-500/60 transition-colors text-ink-muted hover:text-brand-700 disabled:opacity-40"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" aria-hidden>
+                <path d="M21 12.5V7a4 4 0 0 0-8 0v10a2.5 2.5 0 0 0 5 0V8" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+
             <div className="flex-1 relative glass rounded-2xl">
               <textarea
                 ref={inputRef}
@@ -284,7 +448,9 @@ export default function ChatView({
                   }
                 }}
                 placeholder={
-                  messages.length
+                  uploadedDocs.length
+                    ? "Ask about the uploaded document(s) or the corpus…"
+                    : messages.length
                     ? "Ask a follow-up… (Shift+Enter for newline)"
                     : "Ask about a property, amenities, prices…"
                 }
@@ -372,10 +538,12 @@ function AssistantBlock({
   msg,
   activeSid,
   setActiveSid,
+  onRetry,
 }: {
   msg: ChatMessage;
   activeSid: string | null;
   setActiveSid: (sid: string) => void;
+  onRetry?: () => void;
 }) {
   // Per-message disclosure state. Sources stay collapsed by default to
   // keep the chat flow clean; clicking the toggle OR a [Sn] citation
@@ -454,6 +622,12 @@ function AssistantBlock({
             </details>
           )}
         </div>
+      )}
+
+      {/* Error block — only when the upstream call failed.
+          Tone, icon, and retry presence vary by error kind. */}
+      {msg.error && (
+        <ErrorAlert error={msg.error} onRetry={onRetry} />
       )}
 
       {/* Answer — full-width prose, no side panel */}
@@ -566,6 +740,223 @@ function AssistantBlock({
   );
 }
 
+// Compact chip showing an uploaded document in the composer.
+// States: uploading (animated dot), error (red), ready (with page count).
+function UploadedDocChip({
+  doc,
+  onRemove,
+}: {
+  doc: {
+    doc_id: string;
+    title: string;
+    total_pages?: number | null;
+    chunk_count?: number | null;
+    size_kb?: number | null;
+    uploading?: boolean;
+    error?: string | null;
+  };
+  onRemove: () => void;
+}) {
+  const isErr = !!doc.error;
+  return (
+    <div
+      className={`inline-flex items-center gap-1.5 max-w-full px-2.5 py-1 rounded-full border text-[11px] ${
+        isErr
+          ? "border-red-200 bg-red-50 text-red-800"
+          : doc.uploading
+          ? "border-zinc-200 bg-white text-ink-muted"
+          : "border-brand-200 bg-brand-50 text-brand-900"
+      }`}
+      title={isErr ? doc.error || "" : doc.title}
+    >
+      {/* Icon */}
+      {doc.uploading ? (
+        <span className="w-2 h-2 rounded-full bg-amber-500 pulse-dot" aria-hidden />
+      ) : isErr ? (
+        <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+          <path d="M12 8v5M12 17h.01" strokeLinecap="round" />
+        </svg>
+      ) : (
+        <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <path d="M14 2v6h6M9 13h6M9 17h6" strokeLinecap="round" />
+        </svg>
+      )}
+      <span className="truncate max-w-[180px] sm:max-w-[260px]">{doc.title}</span>
+      {!doc.uploading && !isErr && doc.total_pages ? (
+        <span className="font-mono tabular text-[10px] opacity-80">
+          · {doc.total_pages}p
+        </span>
+      ) : null}
+      {doc.uploading && (
+        <span className="text-[10px] uppercase tracking-wider opacity-70">indexing…</span>
+      )}
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label="Remove document"
+        className="ml-0.5 -mr-1 w-5 h-5 inline-flex items-center justify-center rounded-full hover:bg-black/10"
+      >
+        <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+          <path d="M6 6l12 12M18 6L6 18" strokeLinecap="round" />
+        </svg>
+      </button>
+    </div>
+  );
+}
+
+// Error alert — kind-aware styling, retry button when the error is
+// classified as retryable. Severity maps to color: red for things the
+// user/operator can't fix (billing, auth, permission), amber for
+// transient (rate limit, overloaded, network, server), orange for
+// validation/oversize, neutral red for unknown.
+function ErrorAlert({
+  error,
+  onRetry,
+}: {
+  error: ChatError;
+  onRetry?: () => void;
+}) {
+  const { kind, message, retryable, status } = error;
+
+  const tone = pickTone(kind);
+  const Icon = pickIcon(kind);
+  const headline = pickHeadline(kind);
+
+  return (
+    <div
+      role="alert"
+      className={`mb-4 border rounded-xl p-3.5 sm:p-4 flex items-start gap-3
+        ${tone.bg} ${tone.border}`}
+    >
+      <div
+        className={`flex-none w-6 h-6 rounded-full flex items-center justify-center ${tone.iconBg} ${tone.iconFg}`}
+        aria-hidden
+      >
+        <Icon className="w-3.5 h-3.5" />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className={`text-sm font-medium ${tone.headline}`}>
+          {headline}
+          {status ? (
+            <span className={`ml-2 font-mono text-[11px] ${tone.muted}`}>
+              HTTP {status}
+            </span>
+          ) : null}
+          <span className={`ml-2 font-mono text-[11px] ${tone.muted}`}>
+            ({kind})
+          </span>
+        </div>
+        <p className={`mt-1 text-[13px] leading-relaxed ${tone.body}`}>
+          {message}
+        </p>
+        {retryable && onRetry ? (
+          <button
+            type="button"
+            onClick={onRetry}
+            className={`mt-2.5 inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors ${tone.btnBg} ${tone.btnFg}`}
+          >
+            <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+              <path d="M3 12a9 9 0 1 0 3.5-7.1M3 4v6h6" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            Try again
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function pickTone(kind: string) {
+  // billing / auth / permission / validation / request_too_large / model_unavailable
+  // → red (action needed, often by operator)
+  if (["billing", "auth", "permission"].includes(kind)) {
+    return {
+      bg: "bg-red-50",
+      border: "border-red-200",
+      iconBg: "bg-red-200",
+      iconFg: "text-red-900",
+      headline: "text-red-900",
+      body: "text-red-800",
+      muted: "text-red-700/70",
+      btnBg: "bg-red-100 hover:bg-red-200",
+      btnFg: "text-red-900",
+    };
+  }
+  if (["validation", "request_too_large", "model_unavailable"].includes(kind)) {
+    return {
+      bg: "bg-orange-50",
+      border: "border-orange-200",
+      iconBg: "bg-orange-200",
+      iconFg: "text-orange-900",
+      headline: "text-orange-900",
+      body: "text-orange-800",
+      muted: "text-orange-700/70",
+      btnBg: "bg-orange-100 hover:bg-orange-200",
+      btnFg: "text-orange-900",
+    };
+  }
+  // rate_limit / overloaded / server / network / timeout / db → amber/transient
+  return {
+    bg: "bg-amber-50",
+    border: "border-amber-200",
+    iconBg: "bg-amber-200",
+    iconFg: "text-amber-900",
+    headline: "text-amber-900",
+    body: "text-amber-800",
+    muted: "text-amber-700/70",
+    btnBg: "bg-amber-100 hover:bg-amber-200",
+    btnFg: "text-amber-900",
+  };
+}
+
+function pickIcon(kind: string) {
+  const exclaim = (props: any) => (
+    <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+      <path d="M12 8v5M12 17h.01" strokeLinecap="round" />
+    </svg>
+  );
+  const clock = (props: any) => (
+    <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+  const wifi = (props: any) => (
+    <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+      <path d="M5 12a10 10 0 0 1 14 0M8 15a6 6 0 0 1 8 0M12 19h.01" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+  const lock = (props: any) => (
+    <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+      <rect x="4" y="11" width="16" height="9" rx="2" />
+      <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+    </svg>
+  );
+  if (kind === "rate_limit" || kind === "overloaded" || kind === "timeout") return clock;
+  if (kind === "network" || kind === "server" || kind === "db") return wifi;
+  if (kind === "auth" || kind === "permission") return lock;
+  return exclaim;
+}
+
+function pickHeadline(kind: string) {
+  switch (kind) {
+    case "billing":            return "Out of API credits";
+    case "auth":               return "Authentication failed";
+    case "permission":         return "Permission denied";
+    case "rate_limit":         return "Rate-limited";
+    case "overloaded":         return "Model overloaded";
+    case "request_too_large":  return "Request too large";
+    case "model_unavailable":  return "Model unavailable";
+    case "validation":         return "Bad request";
+    case "timeout":            return "Request timed out";
+    case "network":            return "Network error";
+    case "server":             return "Upstream error";
+    case "db":                 return "Database error";
+    default:                   return "Something went wrong";
+  }
+}
+
 function AnswerSkeleton() {
   return (
     <div className="space-y-3">
@@ -674,10 +1065,19 @@ function SourceCard({
 }) {
   const m = source.metadata || {};
   const url = source.url || "";
+  const isUpload = (m.doc_type || "").toLowerCase() === "upload";
   const host = url.replace(/^https?:\/\//, "").split("/")[0];
   const pathName = url.replace(/^https?:\/\/[^/]+/, "");
-  const titleText = m.location || prettifyPath(pathName) || host;
+  // Uploaded docs have synthetic upload:// URLs; show the filename + page
+  // instead of an ugly hostname.
+  const titleText = isUpload
+    ? m.filename || "Uploaded document"
+    : m.location || prettifyPath(pathName) || host;
+
   const facts: { key: string; value: string; tone?: "brand" }[] = [];
+  if (isUpload && m.page) {
+    facts.push({ key: "page", value: `page ${m.page}`, tone: "brand" });
+  }
   if (m.price)
     facts.push({
       key: "price",
@@ -741,19 +1141,32 @@ function SourceCard({
         {source.snippet}
       </p>
 
-      <a
-        href={url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="inline-flex items-center gap-1 text-[0.68rem] font-mono text-brand-700 hover:underline truncate max-w-full"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {host}
-        {pathName}
-        <svg className="w-3 h-3 flex-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" aria-hidden>
-          <path d="M14 4h6v6M14 14l6-6M5 5h6M5 5v14h14v-6" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-      </a>
+      {isUpload ? (
+        <div className="inline-flex items-center gap-1 text-[0.68rem] font-mono text-ink-muted">
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" aria-hidden>
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <path d="M14 2v6h6" strokeLinecap="round" />
+          </svg>
+          <span className="truncate max-w-full">
+            {m.filename || "uploaded.pdf"}
+            {m.page ? <span className="text-brand-700"> · p. {m.page}</span> : null}
+          </span>
+        </div>
+      ) : (
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 text-[0.68rem] font-mono text-brand-700 hover:underline truncate max-w-full"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {host}
+          {pathName}
+          <svg className="w-3 h-3 flex-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" aria-hidden>
+            <path d="M14 4h6v6M14 14l6-6M5 5h6M5 5v14h14v-6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </a>
+      )}
 
       {/* DB traceability footer — click any chip to copy the value to clipboard
           so you can paste straight into a SQL WHERE clause. */}

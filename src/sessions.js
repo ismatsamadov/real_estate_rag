@@ -36,14 +36,26 @@ function deriveTitle(userMessage) {
 // -------- Session CRUD --------
 
 async function listSessions(userId) {
+  // Filter out "ghost" sessions — ones that were created (e.g. via a PDF
+  // upload or by clicking New Chat) but never received a user message.
+  // Sidebar would otherwise show "New chat · 0 messages" rows that the
+  // user doesn't remember creating. Filtered sessions remain in the DB
+  // (cheap and orphaned uploads cascade-delete them automatically) but
+  // never pollute the UI.
   const { rows } = await db.pool.query(
     `SELECT s.session_id, s.title, s.created_at, s.updated_at,
-            (SELECT COUNT(*) FROM ${db.MESSAGES_TABLE} m WHERE m.session_id = s.session_id) AS message_count,
-            (SELECT m.content FROM ${db.MESSAGES_TABLE} m
-              WHERE m.session_id = s.session_id AND m.role = 'user'
-              ORDER BY m.created_at ASC LIMIT 1) AS first_question
+            counts.message_count,
+            counts.first_question
      FROM ${db.SESSIONS_TABLE} s
-     WHERE s.user_id = $1
+     JOIN LATERAL (
+       SELECT
+         COUNT(*) FILTER (WHERE m.session_id = s.session_id) AS message_count,
+         (SELECT m2.content FROM ${db.MESSAGES_TABLE} m2
+           WHERE m2.session_id = s.session_id AND m2.role = 'user'
+           ORDER BY m2.created_at ASC LIMIT 1) AS first_question
+       FROM ${db.MESSAGES_TABLE} m WHERE m.session_id = s.session_id
+     ) counts ON TRUE
+     WHERE s.user_id = $1 AND counts.message_count > 0
      ORDER BY s.updated_at DESC
      LIMIT 100`,
     [userId],
@@ -67,6 +79,24 @@ async function getSession(userId, sessionId) {
      FROM ${db.SESSIONS_TABLE}
      WHERE session_id = $1 AND user_id = $2`,
     [sessionId, userId],
+  );
+  return rows[0] || null;
+}
+
+// Rename a session. Pass `null` (or an empty string) to clear the title —
+// the next user message will then auto-derive a new one via appendUserMessage's
+// `if (!sess.title)` branch. Returns the updated row, or null if not found.
+async function renameSession(userId, sessionId, title) {
+  const normalized =
+    title == null
+      ? null
+      : String(title).replace(/\s+/g, " ").trim().slice(0, 200) || null;
+  const { rows } = await db.pool.query(
+    `UPDATE ${db.SESSIONS_TABLE}
+        SET title = $1, updated_at = NOW()
+      WHERE session_id = $2 AND user_id = $3
+      RETURNING session_id, title, created_at, updated_at`,
+    [normalized, sessionId, userId],
   );
   return rows[0] || null;
 }
@@ -188,6 +218,7 @@ module.exports = {
   listSessions,
   createSession,
   getSession,
+  renameSession,
   deleteSession,
   touchSession,
   listMessages,

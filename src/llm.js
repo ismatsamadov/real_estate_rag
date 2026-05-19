@@ -15,6 +15,7 @@
 const Anthropic = require("@anthropic-ai/sdk");
 const config = require("./config");
 const logger = require("./logger");
+const { classifyError } = require("./errors");
 
 const log = logger.child({ component: "llm" });
 
@@ -83,13 +84,22 @@ async function withRetries(fn, modelId) {
     try {
       return await fn();
     } catch (err) {
-      if (!isRetryable(err) || attempt >= MAX_RETRIES_PER_MODEL) throw err;
+      // Classify before deciding to retry — some errors (billing, auth,
+      // request_too_large) should fail fast with a friendly message even
+      // though their HTTP status would normally be in the retry set.
+      const cls = classifyError(err);
+      if (!cls.retryable || attempt >= MAX_RETRIES_PER_MODEL) {
+        // Attach classification so callers can surface it to the UI
+        // without re-classifying.
+        err.classified = cls;
+        throw err;
+      }
       const retryAfter = Number(err?.headers?.["retry-after"]);
       const backoff = Number.isFinite(retryAfter) && retryAfter > 0
         ? Math.min(MAX_BACKOFF_MS, retryAfter * 1000)
         : Math.min(MAX_BACKOFF_MS, 2 ** attempt * 500 + Math.random() * 250);
       log.warn(
-        { model: modelId, status: err.status, attempt, backoff },
+        { model: modelId, status: err.status, kind: cls.kind, attempt, backoff },
         "anthropic retrying",
       );
       await sleep(backoff);

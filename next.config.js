@@ -17,10 +17,12 @@ const nextConfig = {
   serverExternalPackages: [
     "@anthropic-ai/sdk",
     "voyageai",
-    "@mendable/firecrawl-js",
     "pg",
     "pino",
     "pino-pretty",
+    // pdfjs-dist's worker loader needs the package to stay external
+    // (otherwise Next bundles `pdf.js` but loses `pdf.worker.mjs`).
+    "pdfjs-dist",
   ],
   // Don't fail the build on lint/type warnings — we use .tsx files purely
   // to get ESM parsing inside a CommonJS-rooted repo, not for type safety.

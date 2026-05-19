@@ -3,6 +3,38 @@
 @tailwind utilities;
 
 /* -------------------------------------------------------------------------
+   Mobile / safe-area utilities
+   ------------------------------------------------------------------------- */
+/* iPhone notch + home-bar awareness. `env(safe-area-inset-*)` returns 0
+   on devices without notches, so these are no-ops on desktop. */
+.safe-px {
+  padding-left: max(env(safe-area-inset-left, 0px), 1rem);
+  padding-right: max(env(safe-area-inset-right, 0px), 1rem);
+}
+.safe-pb {
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), 0.75rem);
+}
+.safe-pt {
+  padding-top: max(env(safe-area-inset-top, 0px), 0.5rem);
+}
+/* Stop iOS Safari from zooming the page when an input is focused —
+   only fires when the input's font-size is at least 16px. We force that. */
+input, textarea, select {
+  font-size: 16px;
+}
+@media (min-width: 640px) {
+  input, textarea, select {
+    font-size: inherit;
+  }
+}
+/* Use small-viewport units (svh) where available so the chat thread
+   doesn't get pushed up by the iOS Safari URL bar. Fallback to vh. */
+.h-svh-screen {
+  height: 100vh;
+  height: 100svh;
+}
+
+/* -------------------------------------------------------------------------
    Design tokens
    ------------------------------------------------------------------------- */
 :root {

@@ -2,7 +2,7 @@
   "name": "real-estate-rag",
   "version": "1.0.0",
   "private": true,
-  "description": "Production-grade Retrieval-Augmented Generation system over real estate content. Hybrid retrieval (pgvector + Postgres full-text), Voyage reranking, streaming answers with citation grounding, multilingual eval harness.",
+  "description": "Production-grade Retrieval-Augmented Generation system over PASHA Real Estate content. Hybrid retrieval (pgvector + Postgres full-text), Voyage reranking, streaming answers with citation grounding, cross-session memory, persistent user-intent profile.",
   "type": "commonjs",
   "engines": {
     "node": ">=18.17.0"
@@ -10,21 +10,13 @@
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
-    "start": "next start -p ${PORT:-3000}",
-    "scrape": "node scripts/scrape.js",
-    "ingest": "node scripts/ingest.js",
-    "ask": "node scripts/ask.js",
-    "eval": "node scripts/eval.js",
-    "migrate": "node scripts/migrate.js",
-    "comments": "node scripts/comment-schema.js"
+    "start": "next start -p ${PORT:-3000}"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",
-    "@mendable/firecrawl-js": "^1.28.0",
-    "dotenv": "^16.5.0",
     "lru-cache": "^11.0.2",
     "next": "^15.5.18",
-    "p-limit": "^6.1.0",
+    "pdfjs-dist": "^5.7.284",
     "pg": "^8.16.3",
     "pino": "^9.5.0",
     "pino-pretty": "^13.0.0",
@@ -36,10 +28,13 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@tailwindcss/typography": "^0.5.19",
     "@types/node": "20.17.6",
     "@types/react": "^19.2.14",
     "autoprefixer": "^10.5.0",
+    "dotenv": "^17.4.2",
+    "playwright": "^1.60.0",
     "postcss": "^8.5.15",
     "tailwindcss": "^3.4.19",
     "typescript": "^5.8.2"

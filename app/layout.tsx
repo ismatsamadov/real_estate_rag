@@ -1,5 +1,6 @@
 import "./globals.css";
 import { Inter, Playfair_Display } from "next/font/google";
+import { FavoritesProvider } from "./components/FavoritesContext";
 
 const inter = Inter({
   subsets: ["latin"],
@@ -30,12 +31,16 @@ export const viewport = {
   themeColor: "#0a0a0a",
   width: "device-width",
   initialScale: 1,
+  maximumScale: 5,           // allow zoom for accessibility — never lock to 1
+  viewportFit: "cover" as const, // extend behind iPhone notch + home bar
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${inter.variable} ${playfair.variable}`}>
-      <body className="font-sans">{children}</body>
+      <body className="font-sans">
+        <FavoritesProvider>{children}</FavoritesProvider>
+      </body>
     </html>
   );
 }

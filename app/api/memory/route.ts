@@ -7,6 +7,7 @@
 import { NextResponse } from "next/server";
 import { getUserId } from "../_auth";
 import memory from "../../../src/memory";
+const profile = require("../../../src/profile");
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,6 +20,13 @@ export async function GET(req: Request) {
 
 export async function DELETE(req: Request) {
   const userId = getUserId(req);
-  const deleted = await memory.clearMemory(userId);
+  // Wiping memory also invalidates the LLM-derived intent summary — it was
+  // synthesized from memory + favorites + uploads, and the user just said
+  // "forget me." Signals can still be re-derived from any remaining data;
+  // the cached summary text is what we erase here.
+  const [deleted] = await Promise.all([
+    memory.clearMemory(userId),
+    profile.clearProfile(userId),
+  ]);
   return NextResponse.json({ ok: true, deleted });
 }

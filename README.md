@@ -1,10 +1,11 @@
 # Real Estate RAG
 
-A grounded question-answering system over a luxury real-estate developer's
-public site (`pasharealestate.az`). Ask about a property and the answer is
-streamed back from Claude with every claim tied to a source page you can
-open. Conversations persist, the assistant remembers what you discussed in
-previous chats, and you can save listings you like.
+A grounded question-answering system ([RAG](docs/rag.md) —
+Retrieval-Augmented Generation) over a luxury real-estate developer's
+public site (`pasharealestate.az`). Ask about a property and the answer
+is streamed back from Claude with every claim tied to a source page you
+can open. Conversations persist, the assistant remembers what you
+discussed in previous chats, and you can save listings you like.
 
 ![New chat — landing](screenshots/new%20chat%20page.png)
 
@@ -28,10 +29,15 @@ flowchart LR
 | Layer | Choice | Why |
 |---|---|---|
 | **Frontend + API** | Next.js 15 (App Router) on Vercel | Server-side rendering + streaming responses; native fit for a hosted-API workload |
-| **Database** | **Neon** Postgres + `pgvector` (HNSW) | One store for vectors + metadata + FTS + chat state; no distributed-transaction problem |
-| **Embeddings** | Voyage `voyage-4-large` (1024-d) | Tops the multilingual MTEB; corpus is EN / AZ / RU |
-| **Reranking** | Voyage `rerank-2.5` | Cross-encoder fixes ANN errors at low cost |
-| **LLM** | Anthropic `claude-sonnet-4-6` | Strong grounded QA, prompt caching, citation following |
+| **Database** | **Neon** Postgres + [`pgvector`](docs/pgvector.md) ([HNSW](docs/hnsw.md)) | One store for vectors + metadata + [FTS](docs/tsvector-fts.md) + chat state; no distributed-transaction problem |
+| **Embeddings** | Voyage `voyage-4-large` (1024-d) | Competitive on multilingual [MTEB](docs/mteb.md); corpus is EN / AZ / RU |
+| **Reranking** | Voyage `rerank-2.5` | [Cross-encoder](docs/cross-encoder-rerank.md) fixes [ANN](docs/ann-vs-knn.md) errors at low cost |
+| **LLM** | Anthropic `claude-sonnet-4-6` | Strong grounded QA, [prompt caching](docs/prompt-caching.md), citation following |
+
+> Every technical term in this README is linked to a dedicated explainer
+> under [`docs/`](docs/) — what it is, why we use it, the tradeoffs, and
+> where it shows up in the code. Start at [`docs/glossary.md`](docs/glossary.md)
+> for the index.
 
 ---
 
@@ -86,7 +92,7 @@ If we ever need to scale frontend and backend separately, the RAG core
 lives in [`src/`](src/) and is a thin extraction away from a standalone
 service. Monolith first; split when there's a reason.
 
-### Why Postgres + pgvector, not Pinecone / Weaviate / Qdrant
+### Why Postgres + [pgvector](docs/pgvector.md), not Pinecone / Weaviate / Qdrant
 
 Specialized vector databases are the obvious default. They win at 100M+
 vectors or 1k+ QPS. Below that, the split costs more than it earns:
@@ -181,7 +187,7 @@ start latency. Render is great when you want a managed-Postgres + web
 service combo without thinking. For a hosted-API orchestrator, Vercel is
 the cheapest deploy with the best DX.
 
-### Why hybrid + RRF, not pure vector search
+### Why [hybrid + RRF](docs/hybrid-retrieval.md), not pure vector search
 
 Vector-only retrieval fails on proper nouns. "Knightsbridge" has low
 semantic similarity to "luxury apartment." Searching for "Knightsbridge"
@@ -201,7 +207,7 @@ runs a cross-encoder over the fused top-32 to catch the cases where both
 vector and lexical were wrong. Three retrieval stages, each with a
 distinct failure mode, give a much more robust result than any single one.
 
-### Why `'simple'` tsvector, not `'english'`
+### Why `'simple'` [tsvector](docs/tsvector-fts.md), not `'english'`
 
 This is a small thing that catches most demos: Postgres FTS configs
 include stemming. `'english'` stems "Knightsbridge" to `"knightsbridg"`,
@@ -248,11 +254,17 @@ extraction path is well-trodden.
    - [Stage 18–19 — Self-documenting schema](#stage-1819--self-documenting-schema)
    - [Stage 20 — Real user feedback: the "otaqlı" bug](#stage-20--real-user-feedback-the-otaqlı-bug)
    - [Stage 21 — Favorites](#stage-21--favorites)
+   - [Stage 22-26 — Hardening pass (glossary, errors, mobile, PDF upload)](#stage-22-26--hardening-pass-glossary-errors-mobile-pdf-upload)
+   - [Stage 27 — Self-bootstrapping schema, CLI removal](#stage-27--self-bootstrapping-schema-cli-removal)
+   - [Stage 28 — Persistent user-intent profile](#stage-28--persistent-user-intent-profile)
+   - [Stage 29 — Uploads library, session rename, ghost-session filter](#stage-29--uploads-library-session-rename-ghost-session-filter)
 3. [Quick start](#quick-start)
 4. [Eval results](#eval-results)
 5. [Configuration](#configuration)
 6. [Known weaknesses](#known-weaknesses)
 7. [What I'd do next](#what-id-do-next)
+8. [Repository layout](#repository-layout)
+9. [Interview Q&A — anticipated questions about this project](#interview-qa--anticipated-questions-about-this-project)
 
 ---
 
@@ -326,9 +338,11 @@ Each stage below answers the same three questions:
 
 ### What
 A `documents` parent table and a `rag_chunks` child table in Neon Postgres,
-with HNSW vector index, GIN full-text index, and a GIN jsonb index for
-metadata filters. The `migrate` script applies the schema and verifies
-Voyage embed + rerank endpoints in one pass.
+with an [HNSW](docs/hnsw.md) (Hierarchical Navigable Small World) vector
+index, a [GIN](docs/gin-index.md) (Generalized Inverted Index) full-text
+index, and a GIN [`jsonb`](docs/jsonb.md) index for metadata filters. The
+`migrate` script applies the schema and verifies Voyage embed + rerank
+endpoints in one pass.
 
 ### Why
 A RAG system needs three primitives: vector search, lexical search, and
@@ -429,15 +443,17 @@ extractor used `/otaq/i` which matched both `otaqlı` (total rooms) and
 
 ### What
 A wrapper around Voyage's `voyage-4-large` (1024-d) with:
-- Asymmetric inputType: `"query"` for questions, `"document"` for ingest
+- [Asymmetric retrieval](docs/asymmetric-retrieval.md) — `inputType: "query"`
+  for questions, `"document"` for ingest
 - Retries on 429 / 5xx with exponential backoff
 - Optional throttle for the free-tier 3-RPM gate
-- A `rerank` function on the same client for the cross-encoder stage
+- A `rerank` function on the same client for the [cross-encoder stage](docs/cross-encoder-rerank.md)
 
 ### Why
-Asymmetric retrieval matters. Voyage's models are trained with separate
-projection heads for queries vs documents, and using the wrong head
-measurably hurts recall. Most demos miss this.
+[Asymmetric retrieval](docs/asymmetric-retrieval.md) matters. Voyage's
+models are trained with separate projection heads for queries vs
+documents, and using the wrong head measurably hurts recall. Most demos
+miss this.
 
 The throttle exists because Voyage gates unpaid accounts to 3 requests per
 minute. Without it the ingest pipeline 429s out within a few seconds. With
@@ -463,9 +479,10 @@ in batches. Runs `ANALYZE` at the end.
 
 ### Why
 Re-running ingest on an unchanged corpus needs to be essentially free.
-Every chunk carries a SHA-256 of its content. If the hash matches what's
-already in the DB, embedding is skipped (Voyage costs avoided) and the row
-is left as-is.
+This is the [idempotency](docs/idempotency.md) property — every chunk
+carries a [SHA-256](docs/sha-256.md) of its content, and if the hash
+matches what's already in the DB, embedding is skipped (Voyage costs
+avoided) and the row is left as-is.
 
 ### How
 ```mermaid
@@ -481,8 +498,9 @@ flowchart LR
 
 `ON CONFLICT (doc_id, chunk_index)` handles the upsert. A separate prune
 step deletes any chunks past the new last index — important when a doc's
-content shrank and now produces fewer chunks. After upsert, `ANALYZE`
-refreshes Postgres planner stats for the HNSW index.
+content shrank and now produces fewer chunks. After upsert,
+[`ANALYZE`](docs/analyze.md) refreshes Postgres planner stats for the
+HNSW index.
 
 After ingest: **278 documents, 849 chunks, 1024-dim HNSW index, GIN(tsv)
 and GIN(metadata jsonb) indexes built.**
@@ -494,18 +512,23 @@ and GIN(metadata jsonb) indexes built.**
 **Files:** [`src/retriever.js`](src/retriever.js)
 
 ### What
-A single SQL CTE runs a vector kNN search and a Postgres full-text search
-in parallel, fuses their ranks with Reciprocal Rank Fusion, then pipes the
-candidates through Voyage's cross-encoder reranker. An in-memory LRU caches
-results for 5 minutes. Metadata filters (language, doc_type, price range,
-bedrooms range) attach as `WHERE` clauses.
+A single SQL [CTE](docs/cte.md) (Common Table Expression — named subqueries
+inside one statement) runs a vector [kNN](docs/ann-vs-knn.md) search and a
+Postgres [full-text search](docs/tsvector-fts.md) in parallel, fuses their
+ranks with [Reciprocal Rank Fusion](docs/rrf.md), then pipes the
+candidates through Voyage's [cross-encoder reranker](docs/cross-encoder-rerank.md).
+An in-memory [LRU](docs/lru-cache.md) (Least Recently Used) cache holds
+results for 5 minutes ([TTL](docs/ttl.md)). Metadata filters (language, doc_type, price range,
+bedrooms range) attach as `WHERE` clauses against the
+[`jsonb`](docs/jsonb.md) column.
 
 ### Why
 Vector search alone misses queries with proper nouns: "Knightsbridge" is a
 brand name with low semantic similarity to "luxury apartment." FTS catches
 that. FTS alone misses paraphrase: "ocean view" vs "Caspian Sea panorama."
-Vector catches that. Hybrid + RRF gets both, with no fusion weight to tune.
-Rerank then corrects the ANN errors that slip through HNSW.
+Vector catches that. [Hybrid](docs/hybrid-retrieval.md) + [RRF](docs/rrf.md)
+gets both, with no fusion weight to tune. Rerank then corrects the
+[ANN](docs/ann-vs-knn.md) errors that slip through HNSW.
 
 ### How
 ```mermaid
@@ -523,10 +546,10 @@ flowchart TB
 
 Three points worth flagging:
 
-1. **`'simple'` tsvector config, not `'english'`.** The corpus is
-   multilingual; English stemming would mangle Knightsbridge into
-   `knightsbridg` and break exact-term matching for brand names. `'simple'`
-   tokenizes and lowercases without stemming.
+1. **`'simple'` [tsvector](docs/tsvector-fts.md) config, not `'english'`.**
+   The corpus is multilingual; English stemming would mangle
+   Knightsbridge into `knightsbridg` and break exact-term matching for
+   brand names. `'simple'` tokenizes and lowercases without stemming.
 2. **RRF runs as one CTE.** The fused result is `1.0 / (60 + rank)` summed
    across hit lists, ordered, top-N taken. No application-level merging.
 3. **The rerank is the largest single-step quality bump.** On the eval set,
@@ -550,9 +573,9 @@ the UI can show a "cache hit" pill.
   if Sonnet ever gets retired, never on transient errors).
 - System prompt enforces a strict citation contract and explicit room
   terminology rules.
-- `cache_control: ephemeral` on the system block (prompt caching is wired,
-  though the system prompt is currently under the 1024-token threshold to
-  actually hit).
+- [Prompt caching](docs/prompt-caching.md) — `cache_control: ephemeral`
+  on the system block (wired, though our system prompt is currently
+  under the 1024-token threshold to actually hit).
 
 ### Why
 A grounded QA assistant fails in two ways: it hallucinates facts (cites
@@ -583,7 +606,8 @@ model. Treating those the same way would mask real errors.
 
 ### What
 A 28-question multilingual eval set (EN / AZ / RU, eight categories,
-including "no-match expected" trick questions) scored on five dimensions:
+including "no-match expected" trick questions) scored on five dimensions
+using [LLM-as-judge](docs/llm-as-judge.md):
 - **Retrieval recall** — did any retrieved chunk contain the required
   keyword? (deterministic)
 - **Citation validity** — every `[Sn]` maps to a real retrieved source?
@@ -655,8 +679,9 @@ knowledge about Marriott / Ritz-Carlton. They're listed by name in
 ### What
 Next.js 15 App Router. Middleware gates everything except `/login` and the
 auth + health routes. The login page validates against `DEMO_USERNAME` /
-`DEMO_PASSWORD` env vars (required, no defaults), sets an httpOnly cookie,
-redirects to the original destination.
+`DEMO_PASSWORD` env vars (required, no defaults), sets a
+[httpOnly + sameSite cookie](docs/cookie-security.md), redirects to the
+original destination.
 
 The main shell is `<ChatShell>` — sticky header with a Saved button, a
 collapsible sidebar with session history, and the main chat view with the
@@ -680,8 +705,9 @@ debug the pipeline by glance.
   `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
   `Referrer-Policy`, HSTS, and strips `X-Powered-By`.
 - **Streaming** — the route handler creates a `ReadableStream` that yields
-  SSE-formatted events from `askStream`. A 15-second heartbeat prevents
-  proxies from killing idle streams.
+  [SSE](docs/sse-streaming.md) (Server-Sent Events) formatted events from
+  `askStream`. A 15-second heartbeat prevents proxies from killing idle
+  streams.
 
 The login form is intentionally restrained:
 
@@ -699,12 +725,15 @@ sees the system handles EN / AZ / RU on the first interaction.
 ![Old chat session reopened](screenshots/old%20chat%20session%20page.png)
 
 ### What
-A `sessions` table (one per conversation thread) and a `messages` table
-(append-only user/assistant turns) in Postgres. The streaming endpoint
+A `sessions` table (one per conversation thread, keyed by [UUID](docs/uuid.md))
+and a `messages` table (append-only user/assistant turns, keyed by
+[BIGSERIAL](docs/serial-types.md)) in Postgres. The streaming endpoint
 auto-creates a session on the first user message, persists the user
 message before calling the LLM, persists the assistant message + frozen
 source snapshot + usage metadata after the stream ends. The sidebar lists
 sessions ordered by `updated_at`, with a hover-delete on each row.
+Deletion uses [`ON DELETE CASCADE`](docs/foreign-keys.md) so removing a
+session removes its messages and memory in one statement.
 
 ### Why
 Single-turn stateless retrieval is the 2022 baseline. Anything that calls
@@ -790,11 +819,11 @@ flowchart LR
     B -->|"grounded"| D[embed Q+A pair<br/>Voyage 'document']
     D --> E[INSERT conversation_memory]
 
-    F[New query] --> G[embed Voyage 'query']
+    F[New query] --> G["embed Voyage 'query'"]
     G --> H["vector kNN over<br/>conversation_memory<br/>WHERE user_id = $1<br/>AND session_id ≠ current"]
     H --> I[recency-boost score]
     I --> J["filter sim ≥ 0.42"]
-    J --> K[top 3 → [Mn] in prompt]
+    J --> K["top 3 → [Mn] in prompt"]
 ```
 
 A few design choices worth flagging:
@@ -965,7 +994,7 @@ reappears, the next `npm run eval` will name it as a failure.
 
 ### What
 A `favorites` table with `UNIQUE (user_id, doc_id)` so the heart-toggle is
-idempotent. A React context holds the current user's saved-doc set;
+[idempotent](docs/idempotency.md). A React context holds the current user's saved-doc set;
 `<FavoriteHeart>` renders on each listing source card; clicking toggles
 optimistically with rollback on server error. The header has a "Saved (N)"
 button that opens a modal listing every saved property with editable notes.
@@ -1010,42 +1039,260 @@ Cascade behavior:
 
 ---
 
+## Stage 22-26 — Hardening pass (glossary, errors, mobile, PDF upload)
+
+A consolidated tightening of everything user-facing:
+
+- **Stage 22-23 — Glossary**: every technical term referenced in this
+  README has a dedicated [`docs/*.md`](docs/) deep-dive. 27 entries:
+  RAG, [HNSW](docs/hnsw.md), [pgvector](docs/pgvector.md),
+  [RRF](docs/rrf.md), [MTEB](docs/mteb.md),
+  [cross-encoder rerank](docs/cross-encoder-rerank.md),
+  [tsvector/FTS](docs/tsvector-fts.md), [GIN](docs/gin-index.md),
+  [JSONB](docs/jsonb.md), [CTE](docs/cte.md),
+  [SSE](docs/sse-streaming.md),
+  [LRU](docs/lru-cache.md), [TTL](docs/ttl.md),
+  [SHA-256](docs/sha-256.md), [UUID](docs/uuid.md),
+  [BIGSERIAL](docs/serial-types.md), [ANALYZE](docs/analyze.md),
+  [foreign keys (CASCADE/SET NULL)](docs/foreign-keys.md),
+  [cookie security](docs/cookie-security.md),
+  [idempotency](docs/idempotency.md), and more. Index in
+  [`docs/glossary.md`](docs/glossary.md).
+- **Stage 24 — Friendly Anthropic errors**: 13-kind error classifier in
+  [`src/errors.js`](src/errors.js) — billing exhausted, auth, rate
+  limit (429), overloaded (529), validation, request-too-large,
+  model-unavailable (404), timeout, network, server, db, aborted,
+  unknown. Each kind has a user-facing message and a retry hint.
+- **Stage 25 — Mobile responsive**: 100svh viewports, safe-area insets
+  for iPhone notch / home bar, 16px input font to suppress iOS zoom,
+  per-row hover states swapped for always-visible affordances on touch.
+- **Stage 26 — PDF upload + on-the-fly RAG**: drop a PDF onto any chat
+  → extract pages via `pdfjs-dist` → chunk per page → embed with
+  Voyage → upsert into `documents` + `rag_chunks` with `session_id`
+  denormalized. Retrieval filters with
+  `c.session_id IS NULL OR c.session_id = $sid` so uploads ride the
+  same hybrid pipeline as the public corpus. The meta-document path
+  (`"analyse this doc"`) bypasses relevance ranking and feeds a
+  stride-sampled slice instead.
+
+---
+
+## Stage 27 — Self-bootstrapping schema, CLI removal
+
+**Files:** [`instrumentation.ts`](instrumentation.ts) · [`instrumentation-node.ts`](instrumentation-node.ts) · [`src/db.js`](src/db.js)
+
+### What
+Removed all six CLI scripts (`scripts/scrape.js`, `ingest.js`, `ask.js`,
+`eval.js`, `migrate.js`, `comment-schema.js`) and the `data/` (~27 MB
+of scraped JSONL) and `eval/` (results + eval set) directories.
+Replaced the migration step with a [Next.js
+instrumentation hook](docs/instrumentation.md) that calls
+`db.ensureSchema()` once per server cold boot.
+
+### Why
+The CLI scripts were operational tools used during initial bring-up.
+The corpus is in Neon; the comments are applied; the eval ran. With
+the app reaching demo state, those scripts are dead weight — they
+inflate `package.json`, pull in deps the runtime doesn't need
+(`@mendable/firecrawl-js`, `p-limit`, `dotenv`), and they're a footgun
+for new operators ("did you remember to run `npm run migrate`?").
+
+### How
+[`instrumentation.ts`](instrumentation.ts) gates a
+[**dynamic `import()`**](docs/dynamic-import.md) on
+`NEXT_RUNTIME === "nodejs"`. This keeps `pg` (a Node-native package
+that requires `fs` and `path`) out of the Edge bundle while still
+running schema migrations on Node cold boots. Boot log:
+
+```
+[instrumentation] schema ready
+```
+
+### Cleanup ledger
+
+| Removed | Reason |
+|---|---|
+| `scripts/` (6 files, ~57 KB) | CLI tools no longer needed |
+| `data/` (~27 MB) | Scraped corpus, already loaded into Neon |
+| `eval/` (~1.3 MB) | Eval set + results, results are in README |
+| dep `@mendable/firecrawl-js` | Scraping only |
+| dep `p-limit` | Unused after scripts removed |
+| dep `dotenv` | Next.js loads `.env` natively |
+| `FIRECRAWL_API_KEY` + `SCRAPE_*` env | Orphaned |
+| `INPUT_JSONL` / `OUTPUT_JSONL` env | Orphaned |
+| 6 `package.json` scripts | Code gone |
+
+`npm run` surface is now `dev · build · start`. Nothing else.
+
+---
+
+## Stage 28 — Persistent user-intent profile
+
+**Files:** [`src/profile.js`](src/profile.js) · [`src/prompt.js`](src/prompt.js) · [`src/rag.js`](src/rag.js) · [`app/api/profile/`](app/api/profile/) · [`app/components/Sidebar.tsx`](app/components/Sidebar.tsx) · [`docs/user-profile.md`](docs/user-profile.md) · [`docs/personalization.md`](docs/personalization.md)
+
+![Sidebar profile panel](screenshots/sidebar%20profile%20panel.png)
+
+### What
+A standing 1-2 sentence "what is this user shopping for" summary,
+generated by Claude from the user's saved listings, recent grounded
+Q+A, and uploaded documents. Cached in a `user_profile` table,
+refreshed lazily in the background after each turn changes the
+underlying signals, and injected into the system prompt every turn —
+so the LLM **always knows who it's talking to**, even on the first
+turn of a fresh session.
+
+### Why
+Plain [RAG-over-history](docs/rag.md) is **query-conditional**. If you
+ask "recommend something" in a brand-new session, semantic recall over
+prior Q+A finds nothing — the new query shares no vocabulary with past
+turns. A profile flips this: the model always has the synthesis ("user
+has saved Knightsbridge 2BR, asked twice about St Regis in
+Azerbaijani, uploaded an annual report — likely on a due-diligence
+track") regardless of the question's phrasing.
+
+This is the difference between *"RAG with memory"* and *"the LLM
+knows who I am"*.
+
+### How
+Two-tier context, both surfaced together at request time:
+
+```mermaid
+flowchart LR
+    Q[User question] --> R[rag.askStream]
+    R --> P[(profile.getUserContext)]
+    R --> M[(memory.recallMemory)]
+    P -.parallel.-> R
+    M -.parallel.-> R
+    R --> Pr[buildMessages]
+    Pr --> SP[System + USER PROFILE block + MEMORIES block + Question + Sources]
+    SP --> L[Claude]
+    L --> A[Answer stream]
+    A -.post-stream.-> RF[profile.maybeRefreshProfile]
+    RF --> S[(user_profile.summary updated)]
+```
+
+- **Tier 1 — structured signals** (every turn, 5 parallel SQL reads):
+  saved listings, last 8 grounded questions, uploaded docs, total
+  counts. Zero LLM calls.
+- **Tier 2 — LLM-synthesized summary** (cached, lazy refresh):
+  triggered fire-and-forget *after* the response stream closes.
+  Throttled to `>= 3` new signals **OR** `> 60s` since last write to
+  bound spend. See
+  [`docs/user-profile.md`](docs/user-profile.md) for the full
+  refresh policy.
+
+The injected block sits **above** the memory block and the question, so
+the model frames every answer against the user's standing intent
+before reading the sources.
+
+### Demo
+
+Asking *"based on what you know about me, recommend a 2-bedroom
+apartment"* in a fresh session (no in-session history) — the LLM's
+answer opens with:
+
+> "Based on your profile, here's what I'd recommend exploring next..."
+>
+> "**Already Looked At** — Knightsbridge Residence (specifically
+> 3-bedroom units), The Residences at The St. Regis Baku..."
+
+…then proactively suggests Liman Estate, Ritz-Carlton, and Crescent
+Residences as logical next steps. The recommendation is grounded
+against the corpus (`[Sn]` citations) but framed by the profile.
+
+### Privacy
+- `DELETE /api/profile` clears the summary.
+- `DELETE /api/memory` clears memory **and** profile (consistency:
+  if memory was the basis, the summary should go with it).
+- All reads scoped to `user_id`; no cross-user leakage by construction.
+
+---
+
+## Stage 29 — Uploads library, session rename, ghost-session filter
+
+**Files:** [`src/documents.js`](src/documents.js) · [`src/sessions.js`](src/sessions.js) · [`app/uploads/`](app/uploads/) · [`app/components/UploadsView.tsx`](app/components/UploadsView.tsx) · [`app/components/Sidebar.tsx`](app/components/Sidebar.tsx)
+
+![Uploads library](screenshots/uploads%20library%20page.png)
+
+### What
+Three CRUD completeness fixes:
+
+1. **Cross-session uploads library** (`/uploads`): every PDF the user
+   has uploaded across every session, listed newest first. Per-row
+   delete (cascades to embeddings via FK). Click the session pill →
+   jump back to the chat where it was uploaded.
+2. **Session rename**: hover any sidebar row → pencil + trash buttons.
+   Pencil turns the row into an inline `<input>`; Enter saves, Esc
+   cancels, blur saves (clicking away = commit). Empty value clears
+   the title so the next message re-derives one.
+3. **Ghost-session filter**: sessions with zero messages
+   (e.g. a paperclip-upload abandoned mid-chat) used to clutter the
+   sidebar. `listSessions` now joins via `LATERAL` and filters
+   `message_count > 0`. Rows still exist in the DB (cheap, FK-cascaded
+   on session delete) but never appear in the UI.
+
+### Why
+The user pointed out two real bugs in a row: *"chat names did not
+updated"* (sessions stuck on "New chat" forever) and *"clicking new
+chat but typing nothing and lefting appears as new session in
+leftside"*. Both traced to the upload route pre-stamping `title:
+"New chat"` as a placeholder, which broke the auto-derive logic in
+`appendUserMessage` (the `if (!sess.title)` check fails for a truthy
+placeholder).
+
+The fix was minimal at the API boundary (pass `title: null` instead),
+but the renaming and ghost-filter pieces were CRUD-completeness gaps —
+the sidebar had delete but no rename, and the listing didn't
+distinguish "real" sessions from upload-only ghosts.
+
+### How
+
+| Resource | C | R | U | D |
+|---|---|---|---|---|
+| Session | ✓ | ✓ | **PATCH `/api/sessions/[id]` `{title}`** | ✓ |
+| Uploaded doc | ✓ | ✓ + cross-session list | (re-upload) | ✓ |
+| Favorite | ✓ | ✓ | (delete+create) | ✓ |
+| Memory | auto | stats | (refresh) | bulk |
+| Profile | auto | ✓ | force-refresh | ✓ |
+
+CRUD over every kind of chat data is now exposed in the UI. Messages
+remain immutable by design — editing one would break the citation
+provenance saved in `messages.sources`; the user-facing operations are
+session-level (rename, delete) instead.
+
+---
+
 ## Quick start
 
 ```bash
 # 1. Install
 npm install
 
-# 2. Configure — three required secrets in .env
+# 2. Configure — five required secrets in .env
 cp .env.example .env
-#   DATABASE_URL          Neon Postgres
+#   DATABASE_URL          Neon Postgres (with sslmode=require)
 #   ANTHROPIC_API_KEY     Anthropic
-#   VOYAGE_AI_API_KEY     Voyage AI
-#   FIRECRAWL_API_KEY     (only for scraping)
+#   VOYAGE_AI_API_KEY     Voyage AI (alias: VOYAGE_API_KEY)
 #   DEMO_USERNAME         your login
 #   DEMO_PASSWORD         ≥ 8 chars, your password
 
-# 3. Apply schema + verify Voyage works
-npm run migrate
-
-# 4. Populate the database with column comments (one-time)
-npm run comments
-
-# 5. Build the corpus
-npm run scrape    # Firecrawl map + batch scrape, ~5 min
-npm run ingest    # chunker + Voyage embed + upsert, ~2 min
-
-# 6. Run
+# 3. Run — schema migration is automatic on cold boot
 npm run dev
 # → http://localhost:3000
 ```
 
-Other useful commands:
+That's it. The [`instrumentation.ts`](instrumentation.ts) hook calls
+`db.ensureSchema()` on server boot, so a fresh Neon database is
+populated with tables, indexes, FKs, and the pgvector extension before
+the first request lands. No migration step, no separate seed command —
+the corpus is in Neon already.
+
+Just three npm scripts now: `dev`, `build`, `start`. Everything else is
+in-app.
 
 ```bash
-npm run ask -- "What apartments are at St Regis Baku?"
-npm run eval                # 28-Q multilingual eval with LLM judge
-npm run migrate -- --drop   # destructive: rebuild schema from scratch
+# Regenerate README screenshots after a UI change
+node tools/screenshots.mjs
 ```
 
 ---
@@ -1078,7 +1325,6 @@ Three secrets are required; everything else has a sensible default in
 | `DATABASE_URL` | — (required) | Neon Postgres connection string |
 | `ANTHROPIC_API_KEY` | — (required) | Anthropic API |
 | `VOYAGE_AI_API_KEY` | — (required) | Voyage AI (alias: `VOYAGE_API_KEY`) |
-| `FIRECRAWL_API_KEY` | empty | Only used by `npm run scrape` |
 | `DEMO_USERNAME` | — (required) | Login |
 | `DEMO_PASSWORD` | — (≥ 8 chars, required) | Login |
 | `VOYAGE_EMBED_MODEL` | `voyage-4-large` | Embedding model (must match `VECTOR_DIM`) |
@@ -1154,56 +1400,429 @@ In order of impact for this stack:
 
 ```
 .
-├── app/                          Next.js App Router
-│   ├── api/
-│   │   ├── ask/stream/route.ts   Streaming RAG endpoint
-│   │   ├── auth/{login,logout}/
-│   │   ├── sessions/
-│   │   ├── messages/
-│   │   ├── memory/
-│   │   ├── favorites/
-│   │   └── health/
-│   ├── components/
-│   │   ├── ChatShell.tsx         Top-level layout + state
-│   │   ├── Sidebar.tsx           Session list + memory controls
-│   │   ├── ChatView.tsx          Thread + composer + sources
-│   │   ├── Header.tsx            Brand + Saved button
-│   │   ├── SavedModal.tsx        Favorites view
-│   │   └── FavoritesContext.tsx  Saved-set SSOT
-│   ├── login/
-│   ├── layout.tsx
-│   └── page.tsx
-├── middleware.ts                 Auth gate
-├── src/                          CommonJS RAG core
-│   ├── config.js                 zod-validated env
-│   ├── db.js                     Postgres pool + schema
-│   ├── embedder.js               Voyage embed + rerank
-│   ├── chunker.js                Doc-aware splitter + metadata extractor
-│   ├── retriever.js              Hybrid + RRF + rerank + cache + filters
-│   ├── prompt.js                 System prompt + memory block + sources block
-│   ├── llm.js                    Anthropic streaming, retry, model fallback
-│   ├── rag.js                    Orchestrator (ask + askStream)
-│   ├── sessions.js               Session/message data layer
-│   ├── memory.js                 Cross-session memory
-│   ├── favorites.js              Saved listings
-│   └── logger.js                 pino
-├── scripts/
-│   ├── scrape.js                 Firecrawl map + batch
-│   ├── ingest.js                 JSONL → embeddings → upsert
-│   ├── ask.js                    CLI streaming ask
-│   ├── eval.js                   Multilingual eval + LLM judge
-│   ├── migrate.js                Schema + connectivity check
-│   └── comment-schema.js         pg_description population
-├── eval/
-│   ├── eval-set.jsonl            28 multilingual questions
-│   └── results-*.{md,json}       Generated reports
-├── docs/
-│   └── database.md               Schema reference
-├── screenshots/
+├── instrumentation.ts            Next.js boot hook — gated dynamic import
+├── instrumentation-node.ts       Calls db.ensureSchema() on server cold boot
+├── middleware.ts                 Auth gate + security headers
+├── next.config.js
 ├── vercel.json
 ├── .env.example
-└── next.config.js
+│
+├── app/                          Next.js App Router (frontend + HTTP)
+│   ├── layout.tsx
+│   ├── page.tsx                  / — ChatShell entry
+│   ├── login/                    Server page + LoginForm client component
+│   ├── uploads/                  /uploads — cross-session document library
+│   ├── components/
+│   │   ├── ChatShell.tsx         Top-level layout + active-session state
+│   │   ├── Sidebar.tsx           Sessions + rename + profile panel + memory
+│   │   ├── ChatView.tsx          Thread + composer + sources + PDF upload
+│   │   ├── Header.tsx            Brand + Uploads + Saved + Sign out + GitHub
+│   │   ├── SavedModal.tsx        Favorites view
+│   │   ├── FavoritesContext.tsx  Saved-set SSOT (lifted to root layout)
+│   │   └── UploadsView.tsx       Library page client component
+│   └── api/                      Thin HTTP wrappers around src/ modules
+│       ├── _auth.ts              Cookie → userId helper
+│       ├── health/               Liveness + config snapshot
+│       ├── auth/{login,logout}/  Cookie issue / revoke
+│       ├── sessions/             List · create · get · PATCH rename · delete
+│       ├── messages/             (handled via /api/sessions/[id])
+│       ├── ask/stream/           SSE endpoint — streaming RAG answer
+│       ├── memory/               Stats + bulk clear (also clears profile)
+│       ├── profile/              GET context · DELETE summary
+│       ├── profile/refresh/      POST force-refresh
+│       ├── favorites/            List · create · delete
+│       ├── documents/            Upload PDF · list · delete per session
+│       └── uploads/              Cross-session library list
+│
+├── src/                          CommonJS RAG core (framework-agnostic)
+│   ├── config.js                 zod-validated env
+│   ├── logger.js                 pino
+│   ├── db.js                     Postgres pool · schema · ensureSchema
+│   ├── embedder.js               Voyage embed + rerank (asymmetric inputs)
+│   ├── chunker.js                Listing-aware splitter + metadata extractor
+│   ├── pdf.js                    pdfjs-dist extraction (legacy build)
+│   ├── retriever.js              Hybrid (vector + FTS) + RRF + rerank + cache
+│   ├── prompt.js                 System prompt + profile + memory + sources blocks
+│   ├── llm.js                    Anthropic streaming · retry · model fallback
+│   ├── rag.js                    Orchestrator (ask + askStream + meta-doc path)
+│   ├── sessions.js               Session/message data layer + rename
+│   ├── memory.js                 Cross-session conversation memory
+│   ├── profile.js                LLM-derived intent profile (cached, refreshed lazily)
+│   ├── documents.js              User PDF indexing + cross-session library
+│   ├── favorites.js              Saved listings
+│   └── errors.js                 Friendly error classification (13 kinds)
+│
+├── tools/
+│   └── screenshots.mjs           Playwright regen tool for README images
+│
+├── docs/                         Glossary + deep-dives for every term used
+│   ├── glossary.md               Index of all term docs (start here)
+│   ├── database.md               Full schema reference + ERD
+│   │
+│   │  Retrieval & vector search
+│   ├── rag.md                    Retrieval-Augmented Generation
+│   ├── hybrid-retrieval.md       Vector + lexical fused
+│   ├── asymmetric-retrieval.md   Query vs document embeddings
+│   ├── ann-vs-knn.md             Approximate vs exact nearest neighbor
+│   ├── pgvector.md               Postgres vector extension
+│   ├── hnsw.md                   Hierarchical Navigable Small World
+│   ├── mteb.md                   Massive Text Embedding Benchmark
+│   ├── cross-encoder-rerank.md   Cross-encoder reranking
+│   ├── rrf.md                    Reciprocal Rank Fusion
+│   │
+│   │  Lexical search
+│   ├── tsvector-fts.md           Postgres full-text search + BM25
+│   ├── gin-index.md              Generalized Inverted Index
+│   │
+│   │  Generation
+│   ├── prompt-caching.md         Anthropic cache_control: ephemeral
+│   ├── sse-streaming.md          Server-Sent Events
+│   ├── llm-as-judge.md           Using an LLM to score model outputs
+│   │
+│   │  Storage & caching
+│   ├── jsonb.md                  Postgres binary JSON type
+│   ├── cte.md                    Common Table Expression
+│   ├── lru-cache.md              Least Recently Used eviction policy
+│   ├── ttl.md                    Time To Live (cache + cookie expiry)
+│   │
+│   │  Postgres types & primitives
+│   ├── uuid.md                   UUID primary keys
+│   ├── serial-types.md           BIGSERIAL auto-increment
+│   ├── analyze.md                Refreshing the query planner stats
+│   ├── foreign-keys.md           CASCADE, SET NULL, RESTRICT
+│   │
+│   │  Auth & security
+│   ├── cookie-security.md        httpOnly, sameSite, secure
+│   ├── sha-256.md                Content hashing for idempotent ingest
+│   │
+│   │  Personalization
+│   ├── user-profile.md           LLM-derived standing intent profile
+│   ├── personalization.md        Whole personalization stack + tradeoffs
+│   │
+│   │  Operational
+│   ├── idempotency.md            Why our ingest + favorites are safe to retry
+│   ├── instrumentation.md        Next.js register() hook for schema bootstrap
+│   └── dynamic-import.md         Runtime-conditional bundling
+│
+├── screenshots/                  PNGs embedded in this README
+└── package.json                  Three npm scripts: dev · build · start
 ```
+
+---
+
+## Interview Q&A — anticipated questions about this project
+
+Honest answers grounded in the actual code, not pitch deck claims. If
+an answer says "we don't", that's because we don't.
+
+### Architecture
+
+**Q: Why a monolith on Next.js, not microservices?**
+A single Next.js app on Vercel is the right shape for a single-team,
+single-tenant demo. Microservices would buy operational independence
+we don't need and pay for in network hops, deploy coordination, and
+debugging surface. The natural seam is already there: `src/` is the
+domain logic, `app/api/*` is HTTP glue; if we ever need to extract
+retrieval into its own service, only `app/api/` changes.
+
+**Q: Why pgvector, not Pinecone / Weaviate / Qdrant?**
+Three reasons. (1) **One database** — sessions, messages, memory,
+favorites, profile, AND vectors all live in Postgres. A retrieval
+query joins to listing metadata in the same CTE. With a separate
+vector DB we'd need cross-store joins or duplicated data. (2) **Neon
+is serverless Postgres** — free tier, scale-to-zero, no extra ops.
+(3) **HNSW + cosine ops** match what specialized vector DBs offer at
+this scale (≤ 100k vectors). Above ~10M vectors the calculus changes.
+See [`docs/pgvector.md`](docs/pgvector.md).
+
+**Q: Why Voyage embeddings, not OpenAI / Cohere?**
+Voyage `voyage-4-large` is **#1 on MTEB Retrieval** as of model
+release; `rerank-2.5` is a state-of-the-art cross-encoder. They're
+priced competitively and the API is no-frills (no fine-tuning vendor
+lock-in). See [`docs/mteb.md`](docs/mteb.md) and
+[`docs/cross-encoder-rerank.md`](docs/cross-encoder-rerank.md).
+
+**Q: Why Claude Sonnet 4.6, not GPT-4o / Gemini / Llama?**
+Sonnet 4.6 is currently the strongest model on instruction-following
+and citation discipline within the cost band we wanted. The system
+prompt has very specific constraints (cite `[Sn]` for every claim,
+post-Soviet `otaqlı` conversion, three-language output) — models that
+ignore parts of long system prompts cost us faithfulness points.
+[Prompt caching](docs/prompt-caching.md) further tilts cost in
+Sonnet's favor. Llama would mean self-hosting, which is a different
+project.
+
+### Retrieval
+
+**Q: Why hybrid retrieval, not pure vector?**
+Vector embeddings paraphrase well but miss exact-match terms (project
+names like "Knightsbridge", unit numbers like "503"). Postgres
+[full-text search via `tsvector`](docs/tsvector-fts.md) catches those.
+Fusing them with [Reciprocal Rank Fusion](docs/rrf.md) gives us
+~+7pp recall on the eval set over either alone. See
+[`docs/hybrid-retrieval.md`](docs/hybrid-retrieval.md).
+
+**Q: Why RRF specifically, not weighted score fusion?**
+RRF (Cormack et al. 2009) operates on **ranks**, not raw scores, so
+it doesn't require score calibration between the lexical (BM25-like)
+and dense (cosine) systems. It's also a single hyperparameter (`k=60`).
+We use it in a single SQL CTE in [`src/retriever.js`](src/retriever.js).
+
+**Q: Why rerank after RRF? Doesn't fusion already pick the best?**
+Cross-encoder reranking
+([`docs/cross-encoder-rerank.md`](docs/cross-encoder-rerank.md)) runs
+*both* the query and each candidate through a model that attends
+across them — much better than embedding cosine. We retrieve 32
+candidates (lexical + vector + RRF), rerank with `rerank-2.5`, send
+the top 8 to Claude. Rerank fixes "right doc, wrong section" failures
+where the embedding picks a related chunk over the actually-relevant
+one.
+
+**Q: Why `voyage-4-large` for documents AND queries?**
+Same model, different `inputType` parameter — `document` for ingest,
+`query` for retrieval. The model produces aligned but **asymmetric**
+embeddings, optimized for the directionality of search (queries are
+short and ambiguous; documents are long and concrete). See
+[`docs/asymmetric-retrieval.md`](docs/asymmetric-retrieval.md).
+
+**Q: What's your retrieval latency?**
+~150-300ms cold per query, ~50-80ms warm (LRU cache hits the
+embedding + retrieval). Embedding call is the long pole at ~80-150ms.
+See [`docs/lru-cache.md`](docs/lru-cache.md).
+
+### Generation
+
+**Q: How do you prevent hallucination?**
+Four mechanisms, in priority order:
+1. **Citation contract in the system prompt**: "Every factual claim
+   ends with `[S1]`/`[S2]`. Don't pad citations. Don't use outside
+   knowledge."
+2. **Structured source headers** before each chunk:
+   `[S1] type=listing lang=en extracted_facts={price=…, bedrooms=…} url=…`.
+   The model learns to ground citations on facts, not loose text.
+3. **Memory and profile blocks are flagged NON-citable**. The model
+   may *reference* them ("you previously asked X") but never as
+   evidence.
+4. **Eval surfaces the failures**. Faithfulness 84% on 25 questions —
+   the 4 misses are luxury-brand projects where Claude leaks training
+   knowledge about Marriott / Ritz-Carlton. We name them, we don't
+   hide them.
+
+**Q: Why streaming SSE instead of WebSockets or chunked HTTP?**
+SSE is one-way (server → client), text-based, auto-reconnects, and is
+trivially supported by `ReadableStream` in Next.js route handlers.
+WebSockets give you bidirectional that we don't need; chunked HTTP
+needs custom client framing. See
+[`docs/sse-streaming.md`](docs/sse-streaming.md).
+
+### Memory and personalization
+
+**Q: How does the LLM "remember" me across sessions?**
+Two layers, both in [`src/memory.js`](src/memory.js) and
+[`src/profile.js`](src/profile.js):
+1. **Memory** — RAG-over-history. After every grounded turn we embed
+   the `Q: …\nA: …` pair and persist it in `conversation_memory`.
+   On the next turn, kNN against your `user_id` (excluding the
+   current session). Top-3 with cosine ≥ 0.42 get injected as
+   `[M1]..[M3]` markers (advisory, not citable).
+2. **Profile** — LLM-synthesized 1-2 sentence "what is this user
+   shopping for". Generated by Claude from your favorites + recent
+   topics + uploads, cached in `user_profile`, refreshed lazily after
+   each turn changes the signals. Injected every turn so the LLM
+   always knows who it's talking to.
+
+**Q: Is that creepy? GDPR?**
+- `DELETE /api/memory` wipes memory **and** the profile summary.
+- `DELETE /api/profile` clears just the summary.
+- All reads are scoped to `user_id`; no cross-user leakage.
+- The profile only references signals the user themselves produced
+  (saves, questions, uploads). No external enrichment, no behavioral
+  inference beyond what they typed.
+
+**Q: What if the profile is wrong?**
+The user can rebuild it ("Rebuild profile" button in the sidebar)
+which forces a fresh summary from current signals. Or they can clear
+it and let it regenerate over the next few turns. The model also
+treats it as advisory — if the current question contradicts the
+profile, the question wins.
+
+**Q: Why filter refusals out of memory?**
+A WiFi-password refusal ("I'm sorry, I can't help with that") was
+getting persisted, then re-surfacing in future sessions as if the
+user *wanted* a discussion of refusals. `shouldPersistMemory` in
+[`src/memory.js`](src/memory.js) requires the answer to contain
+`[Sn]` citations — grounding presence is the strongest signal of "this
+was a real answer."
+
+### Multilingual
+
+**Q: How does "3 otaqlı" → "2 bedroom" conversion work?**
+Two-stage. First, a **mechanical regex preprocessor**
+(`preprocessRoomTerminology` in [`src/rag.js`](src/rag.js)) rewrites
+`X otaqlı` → `(X-1)-bedroom` in the retrieval query *before* embedding.
+This is Unicode-aware (`\p{L}` lookahead — Node's default `\b` is
+ASCII-only and fails after `ı`). Second, the system prompt has an
+explicit conversion table so the model knows about the post-Soviet
+rooms-include-living-room convention. Both belt and suspenders.
+
+**Q: Why mechanical regex + LLM rewriting both?**
+Regex catches the simple case deterministically and free. LLM
+rewriting (`rewriteForRetrieval` in [`src/rag.js`](src/rag.js)) resolves
+pronouns in follow-ups: *"What about the cheapest?"* → *"Which St
+Regis unit is the cheapest?"*. Different problems, both worth solving.
+
+### Cost & scaling
+
+**Q: What does a typical query cost?**
+~$0.001–$0.003 with cache-warm. Components: 1 embedding (Voyage,
+~$0.0001), 1 retrieval (Postgres, free), 1 rerank of 32 candidates
+(Voyage, ~$0.0003), 1 Sonnet generation with prompt caching (~$0.001-
+$0.003 depending on output length). Profile refresh adds ~$0.001 but
+is throttled to fire every 60s or 3 signal changes.
+
+**Q: What about at 1000 concurrent users?**
+Neon scales to ~100 concurrent connections per branch (we'd add
+pooling like PgBouncer or use Neon's built-in pooled endpoint).
+Anthropic + Voyage are SaaS — they handle scale. Vercel auto-scales
+the route handlers. The bottleneck would be the retrieval cache hit
+rate (single-process LRU) — at scale we'd replace it with Redis or
+Upstash.
+
+**Q: What happens if Anthropic is down?**
+[`src/llm.js`](src/llm.js) retries on 408/429/500/502/503/504/529 with
+exponential backoff. On 404 (model unavailable) it falls through to
+Haiku as a backup model. On terminal failure, the SSE stream emits
+a `type: "error"` with a classified `kind` (`overloaded`,
+`billing`, `auth`, etc.) and the UI shows a human-readable message
+with a Retry button.
+
+### Evaluation
+
+**Q: How do you know it works?**
+[LLM-as-judge eval](docs/llm-as-judge.md): 25-28 multilingual
+questions with golden answers, scored by Claude on faithfulness +
+answer quality + citation correctness with strict JSON output. Last
+run: faithfulness 84%, answer quality 92%, citation correctness 88%.
+The 4 faithfulness failures are named publicly in the README, not
+buried — they cluster on luxury-brand project lookups where training
+knowledge leaks through.
+
+**Q: Why LLM-as-judge instead of human eval?**
+Cost and speed. 28 questions × 3 human annotators × 5 minutes = 7
+hours per run. We run the eval weekly. LLM judge correlates well
+with human labels on faithfulness for grounded RAG (we spot-checked).
+For categories where judges drift (subjective quality), we'd add
+humans back.
+
+**Q: 28 questions isn't a lot. Is the eval trustworthy?**
+For finding *real bugs*, yes — it caught the otaqlı conversion bug
+and the luxury-brand leakage. For "production-ready" claims at 100k
+QPS, no. We'd scale to 100+ questions with category-balanced
+sampling and a held-out test split before claiming statistical
+significance.
+
+### Operations
+
+**Q: How is the database schema managed?**
+[`src/db.js`](src/db.js) → `ensureSchema()` runs every `CREATE TABLE
+IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, and FK addition (guarded
+by `information_schema` lookups). Called automatically from
+[`instrumentation.ts`](instrumentation.ts) on Next.js cold boot — no
+separate migration step. See
+[`docs/instrumentation.md`](docs/instrumentation.md).
+
+**Q: What if the schema needs a breaking change?**
+Add a new column via `ALTER TABLE … ADD COLUMN IF NOT EXISTS`,
+write a backfill in the same `ensureSchema()` block, deploy. For
+**destructive** changes (rename, drop) we'd write a migration script
+again — that's not the path the auto-bootstrap is designed for.
+
+**Q: How do you handle PDF uploads at scale?**
+[`pdfjs-dist`](https://www.npmjs.com/package/pdfjs-dist) extracts
+text per page, the chunker splits each page (atomic per page, so
+metadata stays clean), Voyage embeds them, and they go into
+`documents` + `rag_chunks` with `session_id` denormalized. Hard caps:
+400 pages, 500k chars, 20 chunks per page. Meta-doc queries
+("analyse this doc") stride-sample chunks instead of relevance-ranking
+them. PDFs over 10 MB are rejected at the route handler.
+
+**Q: How is auth handled?**
+A single shared demo credential (`DEMO_USERNAME` / `DEMO_PASSWORD` in
+env) gated by [`middleware.ts`](middleware.ts). On valid login, a
+cookie `pasha_session=ok` is issued (httpOnly, SameSite=lax, Secure
+in prod). All `/api/*` and non-public routes are gated. When we move
+to multi-tenant, only `getUserId()` in [`app/api/_auth.ts`](app/api/_auth.ts)
+changes — it returns the JWT subject claim instead of a constant. See
+[`docs/cookie-security.md`](docs/cookie-security.md).
+
+**Q: What's in `src/` vs `app/`?**
+[`app/`](app/) is the Next.js shell — pages, components, API route
+handlers. [`src/`](src/) is framework-agnostic CommonJS domain
+logic. The split is intentional: `src/` doesn't import React or
+Next.js anywhere; `app/api/*/route.ts` is thin HTTP glue. If we ever
+swap Next.js for Hono or Fastify, only `app/` changes.
+
+### Specific failure modes
+
+**Q: What's the hardest bug you fixed?**
+The `otaqlı` regex Unicode bug. `\b(\d+)\s*otaqlı\b` in Node's regex
+engine has an ASCII-only `\b` boundary, so it silently failed to
+match after `ı` (U+0131, Turkish dotless i). Took an hour to spot —
+the regex *looked* right and the tests were ASCII-only. Fix: `u` flag
++ `\p{L}` lookahead. The bug came from a real user, in Azerbaijani.
+
+**Q: What's something that surprised you in production?**
+The "New chat" placeholder bug. The PDF upload route pre-stamped
+sessions with `title: "New chat"`, which made `if (!sess.title)` in
+`appendUserMessage` always false → sessions stuck on "New chat"
+forever and ghost sessions accumulated in the sidebar. Fix was
+one-line (pass `null`), but it taught me to be careful with
+"sentinel" string defaults that have semantic meaning elsewhere.
+
+### Tooling
+
+**Q: Why TypeScript on the frontend but CommonJS on the backend?**
+The frontend uses `.tsx` for JSX type-checking. The backend
+(`src/*.js`) is CommonJS because we'd otherwise have to pick an ESM
+ecosystem (which would conflict with `pg`'s CommonJS interop). The
+[dynamic `import()`](docs/dynamic-import.md) in
+`instrumentation.ts` shows the one place we cross the streams cleanly.
+
+**Q: Why no end-to-end tests in CI?**
+Today we run an [LLM-as-judge eval](docs/llm-as-judge.md) instead of
+deterministic E2E because the system's outputs are *non-deterministic
+by design*. A CI gate on faithfulness with a budget (max -5% drop)
+is the right shape — and it's on the "What I'd do next" list.
+
+### Behavioral
+
+**Q: Why this project for the meeting?**
+PASHA's job description called out **document AI for real estate** —
+contracts, brochures, building specifications — as a near-term
+opportunity. This repo demos the full pipeline (retrieval, citation
+grounding, multilingual, document upload, personalization) over
+PASHA's own publicly-scraped catalog. The PDF upload path
+specifically targets the document-AI angle: drop a tender, drop a
+brochure, drop an annual report — same hybrid pipeline, instant Q&A.
+
+**Q: What would you do differently if starting over?**
+Pull the `src/` ↔ `app/` boundary tighter sooner. Several pieces of
+domain logic leaked into route handlers early on and had to be
+extracted. Also: I'd add the [eval harness](docs/llm-as-judge.md)
+before adding features — having a measurable baseline from day one
+would have shortened debug cycles.
+
+**Q: What would you build next if hired?**
+Three things:
+1. **Contract analyzer** — one-button "extract parties / term / payment
+   terms / liability / IP / jurisdiction / termination" with
+   `{value, page, confidence, source_quote}` per field. Same
+   pipeline, structured output.
+2. **CI eval gate** — GitHub Action that runs the eval on every PR
+   and blocks merge if faithfulness drops >5%.
+3. **Observability** — Axiom/Datadog for retrieval mode usage, cache
+   hit rate, token spend per user. The hooks are already in
+   [`src/config.js`](src/config.js) under `observability`.
 
 ---
 

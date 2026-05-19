@@ -2,10 +2,66 @@
 
 const config = require("./config");
 const logger = require("./logger");
+const db = require("./db");
 const { retrieve } = require("./retriever");
 const { buildMessages } = require("./prompt");
 const { complete, completeStream } = require("./llm");
 const memory = require("./memory");
+const profile = require("./profile");
+
+/**
+ * Detect "meta-document" prompts that target an uploaded file as a whole
+ * rather than asking a specific factual question. Examples:
+ *   "analyse this doc"
+ *   "summarize the PDF"
+ *   "what is this contract about?"
+ *   "give me an overview of the file"
+ *
+ * When detected AND the session has uploaded chunks, we bypass keyword
+ * retrieval (which would match random corpus chunks) and feed the LLM a
+ * representative slice of the uploaded document's content directly.
+ */
+const META_DOC_VERB = /\b(analy[sz]e|summari[sz]e|review|brief|tl;?dr|overview|describe|extract|explain|tell me about|what(?: is|'s) (?:in|this))\b/i;
+const META_DOC_TARGET = /\b(this|the|uploaded|attached|my) (doc(?:ument)?|file|pdf|brochure|contract|report|paper|tender|offer|spec|boq)\b/i;
+const SHORT_PROMPT_LIMIT = 80;
+
+function looksLikeMetaDocQuery(question) {
+  const q = String(question || "").trim();
+  if (!q) return false;
+  // Strong signal: verb + target both present
+  if (META_DOC_VERB.test(q) && META_DOC_TARGET.test(q)) return true;
+  // Weaker but high-signal: very short prompt + a verb of inspection
+  if (q.length <= SHORT_PROMPT_LIMIT && META_DOC_VERB.test(q)) return true;
+  // "what does the document say" / "what is in the pdf"
+  if (/^\s*what\b.*\b(doc(?:ument)?|file|pdf|brochure|contract)\b/i.test(q)) return true;
+  return false;
+}
+
+/**
+ * Fetch a representative slice of all uploaded chunks for this session.
+ * Stride-samples so a 100-chunk doc gives ~8 chunks spread across the
+ * whole document — first, several from middle, last. No vector/lexical
+ * scoring; the question is "what's in this doc," not "what's relevant."
+ */
+async function fetchSessionDocChunks(sessionId, { limit = 8 } = {}) {
+  if (!sessionId) return [];
+  const { rows } = await db.pool.query(
+    `SELECT c.id, c.doc_id, c.url, c.chunk_index, c.content, c.metadata
+     FROM ${db.CHUNKS_TABLE} c
+     WHERE c.session_id = $1::uuid
+     ORDER BY c.doc_id, c.chunk_index`,
+    [sessionId],
+  );
+  if (rows.length === 0) return [];
+  if (rows.length <= limit) return rows;
+  // Stride sample to cover the whole document(s).
+  const stride = (rows.length - 1) / (limit - 1);
+  const out = [];
+  for (let i = 0; i < limit; i++) {
+    out.push(rows[Math.round(i * stride)]);
+  }
+  return out;
+}
 
 const log = logger.child({ component: "rag" });
 
@@ -220,29 +276,95 @@ async function* askStream(question, options = {}) {
     }
   }
 
-  // Recall cross-session memory (best-effort; never fails the request).
-  // We use the REWRITTEN query for recall so follow-ups resolve correctly.
+  // Recall cross-session memory + read the standing user profile in parallel.
+  // Both are best-effort: memory adds [Mn] continuity cues; profile injects
+  // a "who is this user" block so the model frames every answer against the
+  // user's standing intent (saved listings, recent topics, uploaded docs,
+  // LLM-derived summary). Failures never fail the request.
   let memories = [];
+  let userContext = null;
   if (options.userId) {
-    try {
-      memories = await memory.recallMemory(options.userId, retrievalQuery, {
+    const [memRes, ctxRes] = await Promise.allSettled([
+      memory.recallMemory(options.userId, retrievalQuery, {
         excludeSessionId: options.sessionId || null,
         topK: memory.RECALL_TOP_K,
-      });
-      if (memories.length) {
-        yield { type: "memories", memories };
+      }),
+      profile.getUserContext(options.userId),
+    ]);
+    if (memRes.status === "fulfilled") {
+      memories = memRes.value || [];
+      if (memories.length) yield { type: "memories", memories };
+    } else {
+      log.warn({ err: memRes.reason?.message }, "memory recall failed");
+    }
+    if (ctxRes.status === "fulfilled") {
+      userContext = ctxRes.value;
+      if (userContext?.summary || userContext?.favorites?.length || userContext?.uploads?.length) {
+        yield {
+          type: "user_profile",
+          summary: userContext.summary,
+          favoriteCount: userContext.counts?.favorite_n ?? 0,
+          uploadCount: userContext.counts?.upload_n ?? 0,
+          memoryCount: userContext.counts?.memory_n ?? 0,
+        };
       }
-    } catch (err) {
-      log.warn({ err: err.message }, "memory recall failed");
+    } else {
+      log.warn({ err: ctxRes.reason?.message }, "profile read failed");
     }
   }
 
+  // META-DOCUMENT PATH:
+  // If the user is asking ABOUT an uploaded document as a whole
+  // ("analyse this doc", "summarize the PDF", "tell me about this contract")
+  // AND we have uploaded chunks for this session, skip keyword retrieval
+  // entirely and feed a stride-sampled slice of the doc to the LLM. This
+  // is the difference between "I asked for an analysis and got 8 random
+  // matches on the word 'analyse'" and "I asked for an analysis and got
+  // an actual analysis of the document."
   let retrieved;
-  try {
-    retrieved = await retrieve(retrievalQuery, options);
-  } catch (err) {
-    yield { type: "error", error: err.message || "Retrieval failed." };
-    return;
+  let usedMetaDoc = false;
+  if (options.sessionId && looksLikeMetaDocQuery(q)) {
+    const topK = Math.min(20, Math.max(1, options.topK ?? config.retrieval.topK));
+    const docRows = await fetchSessionDocChunks(options.sessionId, {
+      limit: Math.max(8, topK),
+    });
+    if (docRows.length > 0) {
+      const sources = docRows.map((r, i) => ({
+        sid: `S${i + 1}`,
+        id: Number(r.id),
+        doc_id: r.doc_id,
+        url: r.url,
+        chunk_index: r.chunk_index,
+        score: 1,
+        rerank_score: null,
+        vector_score: 0,
+        lexical_score: 0,
+        rrf_score: 0,
+        content: r.content,
+        snippet: String(r.content || "")
+          .replace(/\s+/g, " ")
+          .slice(0, 240),
+        metadata:
+          typeof r.metadata === "string" ? JSON.parse(r.metadata) : r.metadata || {},
+      }));
+      retrieved = {
+        sources,
+        mode: "meta-doc",
+        reranked: false,
+        fallback: null,
+        cached: false,
+      };
+      usedMetaDoc = true;
+    }
+  }
+
+  if (!retrieved) {
+    try {
+      retrieved = await retrieve(retrievalQuery, options);
+    } catch (err) {
+      yield { type: "error", error: err.message || "Retrieval failed." };
+      return;
+    }
   }
 
   // streaming path uses memories block; synchronous ask() does not (keeps
@@ -255,6 +377,7 @@ async function* askStream(question, options = {}) {
     reranked,
     fallback,
     cached,
+    metaDoc: usedMetaDoc,
     topK: options.topK ?? config.retrieval.topK,
   };
 
@@ -267,15 +390,23 @@ async function* askStream(question, options = {}) {
   const { system, messages } = buildMessages(q, sources, {
     history: options.history,
     memories,
+    userContext,
   });
 
   let chosenModel = null;
   let answerLength = 0;
+  // Meta-document analyses (summarize / analyse / overview) need much more
+  // output room than a normal Q+A. A normal answer is a sentence or two;
+  // a document summary is a multi-section structured response with tables,
+  // easily 1500-3000 tokens. Bump the cap when we know that's the shape.
+  const effectiveMaxTokens =
+    options.maxTokens ??
+    (usedMetaDoc ? Math.max(config.anthropic.maxTokens, 4000) : config.anthropic.maxTokens);
   try {
     for await (const event of completeStream({
       system,
       messages,
-      maxTokens: options.maxTokens,
+      maxTokens: effectiveMaxTokens,
       temperature: options.temperature,
     })) {
       if (event.type === "model") chosenModel = event.model;
@@ -292,6 +423,12 @@ async function* askStream(question, options = {}) {
     { ms: Date.now() - t0, mode, sources: sources.length, model: chosenModel, chars: answerLength },
     "askStream complete"
   );
+
+  // After the user's response has finished streaming, trigger a background
+  // refresh of the standing intent profile. This is fire-and-forget; the
+  // module throttles internally (>= 3 new signals OR >60s since last write).
+  // We deliberately do NOT await — the response is already flushed by now.
+  if (options.userId) profile.maybeRefreshProfile(options.userId);
 }
 
 module.exports = { ask, askStream };

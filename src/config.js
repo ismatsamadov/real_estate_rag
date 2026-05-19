@@ -1,7 +1,8 @@
 "use strict";
 
-const path = require("node:path");
-require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
+// Next.js loads .env automatically (see https://nextjs.org/docs/app/building-your-application/configuring/environment-variables).
+// No explicit dotenv call here — process.env is already populated by the
+// time this module is required.
 
 const { z } = require("zod");
 
@@ -26,7 +27,6 @@ const schema = z.object({
   // Accept either VOYAGE_API_KEY (per Voyage's docs) or VOYAGE_AI_API_KEY.
   VOYAGE_API_KEY: z.string().optional().default(""),
   VOYAGE_AI_API_KEY: z.string().optional().default(""),
-  FIRECRAWL_API_KEY: z.string().optional().default(""),
 
   // Embeddings
   VOYAGE_EMBED_MODEL: z.string().default("voyage-4-large"),
@@ -71,20 +71,6 @@ const schema = z.object({
   RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(30),
   ALLOWED_ORIGINS: z.string().default(""),
 
-  // Scraping
-  SITEMAP_URL: z.string().url().default("https://pasharealestate.az/sitemap.xml"),
-  SCRAPE_BASE_URL: z.string().url().default("https://pasharealestate.az"),
-  SCRAPE_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
-  SCRAPE_RETRY_MAX: z.coerce.number().int().min(0).max(10).default(3),
-  SCRAPE_MAX_PAGES: z.coerce.number().int().min(1).max(50_000).default(2000),
-  SCRAPE_LANGUAGES: z.string().default("en,az,ru"),
-  SCRAPE_USE_PLAYWRIGHT: boolString(true),
-  ALLOW_INSECURE_SITEMAP_TLS: boolString(false),
-
-  // Paths
-  INPUT_JSONL: z.string().default("data/corpus.jsonl"),
-  OUTPUT_JSONL: z.string().default("data/corpus.jsonl"),
-
   // Observability
   AXIOM_DATASET: z.string().optional().default(""),
   AXIOM_TOKEN: z.string().optional().default(""),
@@ -116,19 +102,11 @@ if (!voyageKey) {
   );
   process.exit(1);
 }
-const repoRoot = path.resolve(__dirname, "..");
-
 const config = Object.freeze({
   env: env.NODE_ENV,
   isProd: env.NODE_ENV === "production",
   logLevel: env.LOG_LEVEL,
   port: env.PORT,
-
-  paths: Object.freeze({
-    repoRoot,
-    inputJsonl: path.resolve(repoRoot, env.INPUT_JSONL),
-    outputJsonl: path.resolve(repoRoot, env.OUTPUT_JSONL),
-  }),
 
   db: Object.freeze({
     url: env.DATABASE_URL,
@@ -152,10 +130,6 @@ const config = Object.freeze({
     rpm: env.VOYAGE_RPM,
   }),
 
-  firecrawl: Object.freeze({
-    apiKey: env.FIRECRAWL_API_KEY,
-  }),
-
   embedding: Object.freeze({
     model: env.VOYAGE_EMBED_MODEL,
     dim: env.VECTOR_DIM,
@@ -177,19 +151,6 @@ const config = Object.freeze({
     chunkOverlap: env.CHUNK_OVERLAP,
     minChunkSize: env.MIN_CHUNK_SIZE,
     batchSize: env.INGEST_BATCH_SIZE,
-  }),
-
-  scrape: Object.freeze({
-    sitemapUrl: env.SITEMAP_URL,
-    baseUrl: env.SCRAPE_BASE_URL,
-    concurrency: env.SCRAPE_CONCURRENCY,
-    retryMax: env.SCRAPE_RETRY_MAX,
-    maxPages: env.SCRAPE_MAX_PAGES,
-    languages: env.SCRAPE_LANGUAGES.split(",")
-      .map((l) => l.trim().toLowerCase())
-      .filter(Boolean),
-    usePlaywright: env.SCRAPE_USE_PLAYWRIGHT,
-    allowInsecureTls: env.ALLOW_INSECURE_SITEMAP_TLS,
   }),
 
   rateLimit: Object.freeze({

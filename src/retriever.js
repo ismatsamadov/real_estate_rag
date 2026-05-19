@@ -40,7 +40,7 @@ const cache = config.retrieval.cacheTtlMs > 0
     })
   : null;
 
-function cacheKey({ q, mode, topK, candidateK, doRerank, filters }) {
+function cacheKey({ q, mode, topK, candidateK, doRerank, filters, sessionId }) {
   return JSON.stringify({
     q: q.toLowerCase().replace(/\s+/g, " ").trim(),
     mode,
@@ -48,6 +48,7 @@ function cacheKey({ q, mode, topK, candidateK, doRerank, filters }) {
     candidateK,
     doRerank,
     filters,
+    sessionId: sessionId || null,
   });
 }
 
@@ -118,16 +119,33 @@ function buildFilterClause(filters, startIdx = 1) {
   };
 }
 
+// Session-scope clause. The corpus is "public" (session_id IS NULL) by
+// default. When the caller provides a sessionId, we also include any
+// chunks uploaded for THAT session — so the user's PDF gets retrieved
+// alongside the public corpus, and never sees other users' uploads.
+function buildSessionScopeClause(sessionId, startIdx = 1) {
+  if (!sessionId) {
+    return { clause: `AND c.session_id IS NULL`, values: [], nextParam: startIdx };
+  }
+  return {
+    clause: `AND (c.session_id IS NULL OR c.session_id = $${startIdx}::uuid)`,
+    values: [sessionId],
+    nextParam: startIdx + 1,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Search SQL
 // ---------------------------------------------------------------------------
 
-async function hybridSearch({ qv, qt, candidateK, rrfK, filters }) {
-  // The filter clause is referenced twice (once per subquery). pg's
-  // positional $N binding means we duplicate the values with two distinct
-  // parameter offsets.
-  const f1 = buildFilterClause(filters, 5);
-  const f2 = buildFilterClause(filters, f1.nextParam);
+async function hybridSearch({ qv, qt, candidateK, rrfK, filters, sessionId }) {
+  // The filter + session scope clauses are referenced twice (once per
+  // subquery). pg's positional $N binding means we duplicate the values
+  // with two distinct parameter offsets.
+  const s1 = buildSessionScopeClause(sessionId, 5);
+  const f1 = buildFilterClause(filters, s1.nextParam);
+  const s2 = buildSessionScopeClause(sessionId, f1.nextParam);
+  const f2 = buildFilterClause(filters, s2.nextParam);
 
   const sql = `
     WITH params AS (
@@ -142,7 +160,7 @@ async function hybridSearch({ qv, qt, candidateK, rrfK, filters }) {
              ROW_NUMBER() OVER (ORDER BY c.embedding <=> p.qv) AS rnk,
              1 - (c.embedding <=> p.qv) AS sim
       FROM ${db.CHUNKS_TABLE} c, params p
-      WHERE TRUE ${f1.clause}
+      WHERE TRUE ${s1.clause} ${f1.clause}
       ORDER BY c.embedding <=> p.qv
       LIMIT (SELECT candidate_k FROM params)
     ),
@@ -151,7 +169,7 @@ async function hybridSearch({ qv, qt, candidateK, rrfK, filters }) {
              ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.tsv, p.qt) DESC) AS rnk,
              ts_rank_cd(c.tsv, p.qt) AS lex
       FROM ${db.CHUNKS_TABLE} c, params p
-      WHERE c.tsv @@ p.qt ${f2.clause}
+      WHERE c.tsv @@ p.qt ${s2.clause} ${f2.clause}
       ORDER BY ts_rank_cd(c.tsv, p.qt) DESC
       LIMIT (SELECT candidate_k FROM params)
     ),
@@ -177,13 +195,23 @@ async function hybridSearch({ qv, qt, candidateK, rrfK, filters }) {
     LIMIT (SELECT candidate_k FROM params)
   `;
 
-  const values = [qv, qt, candidateK, rrfK, ...f1.values, ...f2.values];
+  const values = [
+    qv,
+    qt,
+    candidateK,
+    rrfK,
+    ...s1.values,
+    ...f1.values,
+    ...s2.values,
+    ...f2.values,
+  ];
   const { rows } = await db.pool.query(sql, values);
   return rows;
 }
 
-async function vectorSearch({ qv, candidateK, filters }) {
-  const { clause, values: fvals } = buildFilterClause(filters, 3);
+async function vectorSearch({ qv, candidateK, filters, sessionId }) {
+  const sc = buildSessionScopeClause(sessionId, 3);
+  const ff = buildFilterClause(filters, sc.nextParam);
   const sql = `
     SELECT
       c.id, c.doc_id, c.url, c.chunk_index, c.content, c.metadata,
@@ -191,16 +219,17 @@ async function vectorSearch({ qv, candidateK, filters }) {
       0::double precision AS lexical_score,
       0::double precision AS rrf_score
     FROM ${db.CHUNKS_TABLE} c
-    WHERE TRUE ${clause}
+    WHERE TRUE ${sc.clause} ${ff.clause}
     ORDER BY c.embedding <=> $1::vector
     LIMIT $2::int
   `;
-  const { rows } = await db.pool.query(sql, [qv, candidateK, ...fvals]);
+  const { rows } = await db.pool.query(sql, [qv, candidateK, ...sc.values, ...ff.values]);
   return rows;
 }
 
-async function lexicalSearch({ qt, candidateK, filters }) {
-  const { clause, values: fvals } = buildFilterClause(filters, 3);
+async function lexicalSearch({ qt, candidateK, filters, sessionId }) {
+  const sc = buildSessionScopeClause(sessionId, 3);
+  const ff = buildFilterClause(filters, sc.nextParam);
   const sql = `
     SELECT
       c.id, c.doc_id, c.url, c.chunk_index, c.content, c.metadata,
@@ -208,11 +237,11 @@ async function lexicalSearch({ qt, candidateK, filters }) {
       ts_rank_cd(c.tsv, plainto_tsquery('simple', $1)) AS lexical_score,
       0::double precision AS rrf_score
     FROM ${db.CHUNKS_TABLE} c
-    WHERE c.tsv @@ plainto_tsquery('simple', $1) ${clause}
+    WHERE c.tsv @@ plainto_tsquery('simple', $1) ${sc.clause} ${ff.clause}
     ORDER BY ts_rank_cd(c.tsv, plainto_tsquery('simple', $1)) DESC
     LIMIT $2::int
   `;
-  const { rows } = await db.pool.query(sql, [qt, candidateK, ...fvals]);
+  const { rows } = await db.pool.query(sql, [qt, candidateK, ...sc.values, ...ff.values]);
   return rows;
 }
 
@@ -288,9 +317,11 @@ async function retrieve(question, opts = {}) {
   const candidateK = Math.max(topK, opts.candidateK ?? config.retrieval.candidateK);
   const doRerank = opts.rerank ?? config.retrieval.rerank;
   const filters = opts.filters || null;
+  const sessionId = opts.sessionId || null;
 
-  // Cache check
-  const key = cacheKey({ q, mode, topK, candidateK, doRerank, filters });
+  // Cache check — include sessionId in the key so uploaded-doc queries
+  // don't share a cache entry with public-corpus queries.
+  const key = cacheKey({ q, mode, topK, candidateK, doRerank, filters, sessionId });
   if (cache) {
     const hit = cache.get(key);
     if (hit) {
@@ -304,10 +335,10 @@ async function retrieve(question, opts = {}) {
   let fallback = null;
 
   if (mode === "lexical") {
-    rows = await lexicalSearch({ qt: q, candidateK, filters });
+    rows = await lexicalSearch({ qt: q, candidateK, filters, sessionId });
   } else if (mode === "vector") {
     const qv = toVectorLiteral(await embed(q, "query"));
-    rows = await vectorSearch({ qv, candidateK, filters });
+    rows = await vectorSearch({ qv, candidateK, filters, sessionId });
   } else {
     // hybrid
     const qv = toVectorLiteral(await embed(q, "query"));
@@ -317,12 +348,13 @@ async function retrieve(question, opts = {}) {
       candidateK,
       rrfK: config.retrieval.rrfK,
       filters,
+      sessionId,
     });
     if (!rows.length) {
       // Lexical query may have been empty (stop-words only) or matched
       // nothing under the current filters. Fall back to pure vector.
       log.info({ q: q.slice(0, 80) }, "hybrid empty -> falling back to vector");
-      rows = await vectorSearch({ qv, candidateK, filters });
+      rows = await vectorSearch({ qv, candidateK, filters, sessionId });
       usedMode = "vector";
       fallback = "lexical-empty";
     }

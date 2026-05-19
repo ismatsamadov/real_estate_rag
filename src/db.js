@@ -29,6 +29,7 @@ const SESSIONS_TABLE = quoteIdent("sessions");
 const MESSAGES_TABLE = quoteIdent("messages");
 const MEMORY_TABLE = quoteIdent("conversation_memory");
 const FAVORITES_TABLE = quoteIdent("favorites");
+const USER_PROFILE_TABLE = quoteIdent("user_profile");
 const HNSW_INDEX = quoteIdent(`${config.db.table}_embedding_hnsw_idx`);
 const TSV_INDEX = quoteIdent(`${config.db.table}_tsv_gin_idx`);
 const DOC_INDEX = quoteIdent(`${config.db.table}_doc_id_idx`);
@@ -55,9 +56,10 @@ async function ensureSchema() {
   await withClient(async (client) => {
     await client.query("CREATE EXTENSION IF NOT EXISTS vector");
 
-    // Parent table — one row per scraped page/listing.
-    // Holds doc-level metadata (price, location, language, type) so we can
-    // filter at retrieval time without scanning chunks.
+    // Parent table — one row per scraped page/listing OR per user-uploaded
+    // document (when session_id is non-null). Doc-level metadata (price,
+    // location, language, type) is filterable at retrieval time without
+    // scanning chunks.
     await client.query(`
       CREATE TABLE IF NOT EXISTS ${DOCS_TABLE} (
         doc_id        TEXT PRIMARY KEY,
@@ -121,6 +123,7 @@ async function ensureSchema() {
       CREATE INDEX IF NOT EXISTS ${CHUNK_META_INDEX}
         ON ${CHUNKS_TABLE} USING gin (metadata jsonb_path_ops)
     `);
+
 
     // pgcrypto for gen_random_uuid() — pgvector usually pulls this in, but
     // create explicitly so the migration is self-contained.
@@ -191,6 +194,47 @@ async function ensureSchema() {
         WITH (m = 16, ef_construction = 64)
     `);
 
+    // -----------------------------------------------------------------------
+    // session_id linkage for user-uploaded documents
+    //
+    // Added LATE (after sessions exists) so the FK target is available.
+    // documents.session_id IS NULL          → public corpus row (scraped)
+    // documents.session_id = some UUID      → user-uploaded for that session
+    // rag_chunks.session_id is denormalized from documents.session_id so
+    // retrieval can filter without a JOIN.
+    // -----------------------------------------------------------------------
+    await client.query(`
+      ALTER TABLE ${DOCS_TABLE}
+        ADD COLUMN IF NOT EXISTS session_id UUID NULL
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE constraint_name = 'documents_session_fk'
+        ) THEN
+          ALTER TABLE ${DOCS_TABLE}
+            ADD CONSTRAINT documents_session_fk
+            FOREIGN KEY (session_id)
+            REFERENCES ${SESSIONS_TABLE}(session_id)
+            ON DELETE CASCADE;
+        END IF;
+      END$$;
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS ${quoteIdent("documents_session_idx")}
+        ON ${DOCS_TABLE} (session_id) WHERE session_id IS NOT NULL
+    `);
+    await client.query(`
+      ALTER TABLE ${CHUNKS_TABLE}
+        ADD COLUMN IF NOT EXISTS session_id UUID NULL
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS ${quoteIdent("rag_chunks_session_idx")}
+        ON ${CHUNKS_TABLE} (session_id) WHERE session_id IS NOT NULL
+    `);
+
     // Favorites — saved listings per user.
     // UNIQUE(user_id, doc_id) makes "save" idempotent (clicking the heart
     // twice in quick succession produces at most one row). ON DELETE
@@ -209,6 +253,33 @@ async function ensureSchema() {
       CREATE INDEX IF NOT EXISTS ${FAVORITES_USER_INDEX}
         ON ${FAVORITES_TABLE} (user_id, created_at DESC)
     `);
+
+    // ---------------------------------------------------------------------
+    // Persistent user-intent profile.
+    //
+    //   summary           LLM-synthesized 1-2 sentence "what this user is
+    //                     shopping for", refreshed lazily after a turn
+    //                     changes the underlying signals.
+    //   basis_*_n         counts of memory/favorite/upload rows at the time
+    //                     the summary was last generated — used to decide
+    //                     whether the summary is stale.
+    //   refreshed_at      when the summary was last rewritten.
+    //
+    // This row is read every turn (cheap, primary-key lookup) and injected
+    // into the prompt above sources so the model knows who it's talking to,
+    // not just what they're asking right now.
+    // ---------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ${USER_PROFILE_TABLE} (
+        user_id           TEXT PRIMARY KEY,
+        summary           TEXT,
+        basis_memory_n    INT NOT NULL DEFAULT 0,
+        basis_favorite_n  INT NOT NULL DEFAULT 0,
+        basis_upload_n    INT NOT NULL DEFAULT 0,
+        refreshed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
   });
   log.info(
     {
@@ -224,6 +295,7 @@ async function ensureSchema() {
 
 async function dropSchema() {
   await withClient(async (client) => {
+    await client.query(`DROP TABLE IF EXISTS ${USER_PROFILE_TABLE} CASCADE`);
     await client.query(`DROP TABLE IF EXISTS ${FAVORITES_TABLE} CASCADE`);
     await client.query(`DROP TABLE IF EXISTS ${MEMORY_TABLE} CASCADE`);
     await client.query(`DROP TABLE IF EXISTS ${MESSAGES_TABLE} CASCADE`);
@@ -265,6 +337,7 @@ module.exports = {
   MESSAGES_TABLE,
   MEMORY_TABLE,
   FAVORITES_TABLE,
+  USER_PROFILE_TABLE,
   // Back-compat alias used by older modules.
   TABLE: CHUNKS_TABLE,
   quoteIdent,

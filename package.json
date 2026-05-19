@@ -15,7 +15,8 @@
     "ingest": "node scripts/ingest.js",
     "ask": "node scripts/ask.js",
     "eval": "node scripts/eval.js",
-    "migrate": "node scripts/migrate.js"
+    "migrate": "node scripts/migrate.js",
+    "comments": "node scripts/comment-schema.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",

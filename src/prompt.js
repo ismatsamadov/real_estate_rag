@@ -26,6 +26,12 @@ const SYSTEM_PROMPT = [
   "4. Do not use outside knowledge. If a fact is not in the sources, do not claim it.",
   "5. If a source's extracted_facts (price, bedrooms, area) contradicts its body text, prefer the body text and note the discrepancy.",
   "",
+  "MEMORY vs SOURCES (do not confuse these):",
+  "- [Sn] markers refer to RETRIEVED CORPUS SOURCES for the current turn. Every factual claim cites [Sn].",
+  "- [Mn] markers (if present) are RECALLED MEMORIES from this user's prior sessions. They are continuity context only — you may say \"earlier you asked about X\" or \"as we discussed before\", but NEVER cite [Mn] as evidence for a fact. Facts must still cite [Sn].",
+  "- If a memory contradicts the current sources, the sources win.",
+  "- If the user asks \"what did we talk about?\" or \"remember when…\", you may summarize from [Mn] without citing [Sn].",
+  "",
   "ROOM TERMINOLOGY (IMPORTANT — do not conflate these):",
   "- AZ \"otaqlı\" and RU \"комнатная\" mean TOTAL rooms in the unit (typically including the living room).",
   "- AZ \"yataq otaqlı\", RU \"спальня\", and EN \"bedroom\" mean BEDROOMS specifically.",
@@ -68,18 +74,73 @@ function buildSourcesBlock(sources) {
     .join("\n\n---\n\n");
 }
 
+function buildMemoriesBlock(memories) {
+  if (!Array.isArray(memories) || memories.length === 0) return "";
+  const lines = memories.map((m) => {
+    const when = m.created_at ? new Date(m.created_at).toISOString().slice(0, 10) : "earlier";
+    return `[${m.mid}] (${when}) ${m.content}`;
+  });
+  return [
+    "Recalled from this user's previous conversations (advisory continuity context — NOT citable as facts):",
+    ...lines,
+  ].join("\n");
+}
+
 /**
  * Build messages for Anthropic. System block is cached; user message
- * carries the question + sources.
+ * carries the question + sources + optional memories.
+ *
+ * `history` is an optional ordered list of prior turns within the SAME
+ * session — [{role:"user"|"assistant", content:"..."}]. The assistant's
+ * prior answer text carries forward as conversational state; sources from
+ * past turns are NOT replayed (would blow the budget).
+ *
+ * `memories` is an optional list of recalled memory chunks from OTHER
+ * sessions ({mid, content, created_at, similarity}). These are continuity
+ * cues for the model (e.g. "the user previously asked about X") and must
+ * NOT be cited as factual sources — facts still come from `[Sn]` corpus.
+ *
+ * For the current turn we always append a fresh user message with the
+ * just-retrieved sources, so each generation is grounded against fresh
+ * retrieval rather than stale chunks from older turns.
  */
-function buildMessages(question, sources) {
+function buildMessages(question, sources, { history, memories } = {}) {
   const sourcesBlock = buildSourcesBlock(sources);
+  const memoriesBlock = buildMemoriesBlock(memories);
   const userText = [
+    memoriesBlock,
+    memoriesBlock ? "" : null,
     `Question: ${question}`,
     "",
     "Sources:",
     sourcesBlock,
-  ].join("\n");
+  ]
+    .filter((line) => line !== null && line !== "")
+    .join("\n");
+
+  const historyMsgs = Array.isArray(history)
+    ? history
+        .filter(
+          (m) =>
+            m &&
+            (m.role === "user" || m.role === "assistant") &&
+            typeof m.content === "string" &&
+            m.content.trim(),
+        )
+        // Anthropic requires strict role alternation; drop any consecutive
+        // duplicates defensively.
+        .reduce((acc, m) => {
+          if (acc.length && acc[acc.length - 1].role === m.role) return acc;
+          acc.push({ role: m.role, content: m.content });
+          return acc;
+        }, [])
+    : [];
+
+  // If history ends on a user turn (in-flight), drop it so the new user
+  // message below isn't a back-to-back user role.
+  while (historyMsgs.length && historyMsgs[historyMsgs.length - 1].role === "user") {
+    historyMsgs.pop();
+  }
 
   return {
     system: [
@@ -89,7 +150,7 @@ function buildMessages(question, sources) {
         cache_control: { type: "ephemeral" },
       },
     ],
-    messages: [{ role: "user", content: userText }],
+    messages: [...historyMsgs, { role: "user", content: userText }],
   };
 }
 

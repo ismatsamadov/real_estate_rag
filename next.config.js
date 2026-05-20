@@ -24,6 +24,16 @@ const nextConfig = {
     // (otherwise Next bundles `pdf.js` but loses `pdf.worker.mjs`).
     "pdfjs-dist",
   ],
+  // pdfjs-dist dynamically `import()`s its worker file, which Next.js's
+  // static tracer can't follow. Without this hint Vercel ships pdf.mjs
+  // but not pdf.worker.mjs, and the documents route crashes with
+  // "Setting up fake worker failed: Cannot find module …pdf.worker.mjs".
+  outputFileTracingIncludes: {
+    "/api/documents/**": [
+      "./node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs",
+    ],
+  },
+
   // Don't fail the build on lint/type warnings — we use .tsx files purely
   // to get ESM parsing inside a CommonJS-rooted repo, not for type safety.
   eslint: { ignoreDuringBuilds: true },

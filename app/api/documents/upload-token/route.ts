@@ -23,6 +23,19 @@ export async function POST(req: Request): Promise<Response> {
   // point implies the request is authenticated.
   getUserId(req);
 
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error:
+          "Large-file upload is not configured on this deployment. " +
+          "Either upload a PDF under 4 MB, or set BLOB_READ_WRITE_TOKEN " +
+          "(create a Vercel Blob store and link it to this project).",
+      },
+      { status: 503 },
+    );
+  }
+
   const body = (await req.json()) as HandleUploadBody;
 
   try {

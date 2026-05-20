@@ -283,29 +283,40 @@ export default function ChatView({
       };
       setUploadedDocs((prev) => [placeholder, ...prev]);
 
-      try {
-        // Step 1: PUT the PDF straight to Vercel Blob. This sidesteps
-        // Vercel's 4.5 MB serverless body cap — the browser uploads
-        // directly to blob storage using a short-lived token minted by
-        // /api/documents/upload-token.
-        const blob = await upload(file.name, file, {
-          access: "public",
-          handleUploadUrl: "/api/documents/upload-token",
-          contentType: file.type || "application/pdf",
-        });
+      // Vercel serverless functions cap request bodies at ~4.5 MB. Anything
+      // larger has to take the Blob detour: the browser PUTs the PDF
+      // directly to Vercel Blob, then we hand the URL to the indexing
+      // route. Below the cap, we use the plain multipart path so users
+      // without a Blob store configured can still upload small PDFs.
+      const NEEDS_BLOB_BYTES = 4 * 1024 * 1024;
 
-        // Step 2: hand the blob URL to the indexing endpoint. The server
-        // fetches it, runs the extract→chunk→embed pipeline, then deletes
-        // the blob — we don't keep PDFs in blob storage.
-        const resp = await fetch("/api/documents", {
-          method: "POST",
-          credentials: "include",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            blobUrl: blob.url,
-            ...(sessionId ? { sessionId } : {}),
-          }),
-        });
+      try {
+        let resp: Response;
+        if (file.size > NEEDS_BLOB_BYTES) {
+          const blob = await upload(file.name, file, {
+            access: "public",
+            handleUploadUrl: "/api/documents/upload-token",
+            contentType: file.type || "application/pdf",
+          });
+          resp = await fetch("/api/documents", {
+            method: "POST",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              blobUrl: blob.url,
+              ...(sessionId ? { sessionId } : {}),
+            }),
+          });
+        } else {
+          const form = new FormData();
+          form.append("file", file);
+          if (sessionId) form.append("sessionId", sessionId);
+          resp = await fetch("/api/documents", {
+            method: "POST",
+            body: form,
+            credentials: "include",
+          });
+        }
         const data = await resp.json();
         if (!resp.ok || !data?.ok) {
           throw new Error(data?.error || `Upload failed (HTTP ${resp.status})`);
@@ -347,8 +358,14 @@ export default function ChatView({
 
   const removeUpload = useCallback(
     async (docId: string) => {
-      if (!sessionId) return;
+      // Always remove the chip optimistically. The previous guard returned
+      // before this line on fresh chats (sessionId not yet propagated) and
+      // on upload-error chips, making the X look dead.
       setUploadedDocs((prev) => prev.filter((d) => d.doc_id !== docId));
+
+      // Skip the server DELETE for placeholder/error chips (no DB row yet)
+      // and when we have no session id to scope the call.
+      if (!sessionId || docId.startsWith("pending-")) return;
       try {
         await fetch(
           `/api/documents/${encodeURIComponent(docId)}?sessionId=${sessionId}`,

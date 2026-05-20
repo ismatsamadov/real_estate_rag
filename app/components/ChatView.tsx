@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { upload } from "@vercel/blob/client";
 import { useFavorites } from "./FavoritesContext";
 
 type MemoryChip = {
@@ -283,43 +282,74 @@ export default function ChatView({
       };
       setUploadedDocs((prev) => [placeholder, ...prev]);
 
-      // Vercel serverless functions cap request bodies at ~4.5 MB. Anything
-      // larger has to take the Blob detour: the browser PUTs the PDF
-      // directly to Vercel Blob, then we hand the URL to the indexing
-      // route. Below the cap, we use the plain multipart path so users
-      // without a Blob store configured can still upload small PDFs.
-      const NEEDS_BLOB_BYTES = 4 * 1024 * 1024;
+      // Vercel serverless functions cap request bodies at ~4.5 MB. Small
+      // files take the one-shot multipart path; larger files are split
+      // into ≤3.5 MB chunks and streamed through /api/documents/chunk,
+      // which stages bytes in Postgres and finalizes once all chunks
+      // are present.
+      const CHUNK_THRESHOLD = 4 * 1024 * 1024;
+      const CHUNK_BYTES = Math.floor(3.5 * 1024 * 1024);
+      const MAX_BYTES = 50 * 1024 * 1024;
 
       try {
-        let resp: Response;
-        if (file.size > NEEDS_BLOB_BYTES) {
-          const blob = await upload(file.name, file, {
-            access: "public",
-            handleUploadUrl: "/api/documents/upload-token",
-            contentType: file.type || "application/pdf",
-          });
-          resp = await fetch("/api/documents", {
-            method: "POST",
-            credentials: "include",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              blobUrl: blob.url,
-              ...(sessionId ? { sessionId } : {}),
-            }),
-          });
-        } else {
+        if (file.size > MAX_BYTES) {
+          throw new Error(
+            `File is ${(file.size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_BYTES / 1024 / 1024} MB.`,
+          );
+        }
+
+        let data: any;
+
+        if (file.size <= CHUNK_THRESHOLD) {
           const form = new FormData();
           form.append("file", file);
           if (sessionId) form.append("sessionId", sessionId);
-          resp = await fetch("/api/documents", {
+          const resp = await fetch("/api/documents", {
             method: "POST",
             body: form,
             credentials: "include",
           });
-        }
-        const data = await resp.json();
-        if (!resp.ok || !data?.ok) {
-          throw new Error(data?.error || `Upload failed (HTTP ${resp.status})`);
+          data = await resp.json();
+          if (!resp.ok || !data?.ok) {
+            throw new Error(data?.error || `Upload failed (HTTP ${resp.status})`);
+          }
+        } else {
+          const uploadId = (crypto as any).randomUUID
+            ? (crypto as any).randomUUID()
+            : // Fallback for older browsers: same shape, weaker entropy.
+              "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+                const r = (Math.random() * 16) | 0;
+                const v = c === "x" ? r : (r & 0x3) | 0x8;
+                return v.toString(16);
+              });
+          const totalChunks = Math.ceil(file.size / CHUNK_BYTES);
+          for (let i = 0; i < totalChunks; i++) {
+            const start = i * CHUNK_BYTES;
+            const end = Math.min(start + CHUNK_BYTES, file.size);
+            const part = file.slice(start, end);
+            const form = new FormData();
+            form.append("chunk", part);
+            form.append("uploadId", uploadId);
+            form.append("chunkIndex", String(i));
+            form.append("totalChunks", String(totalChunks));
+            form.append("filename", file.name);
+            if (sessionId) form.append("sessionId", sessionId);
+            const resp = await fetch("/api/documents/chunk", {
+              method: "POST",
+              body: form,
+              credentials: "include",
+            });
+            data = await resp.json();
+            if (!resp.ok || !data?.ok) {
+              throw new Error(
+                data?.error || `Chunk ${i + 1}/${totalChunks} failed (HTTP ${resp.status})`,
+              );
+            }
+          }
+          if (!data.document) {
+            // Sanity — last chunk must have finalized.
+            throw new Error("Upload completed but server did not finalize.");
+          }
         }
         // If the server auto-created the session for us, propagate that.
         if (!sessionId && data.sessionId) {

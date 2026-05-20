@@ -30,6 +30,7 @@ const MESSAGES_TABLE = quoteIdent("messages");
 const MEMORY_TABLE = quoteIdent("conversation_memory");
 const FAVORITES_TABLE = quoteIdent("favorites");
 const USER_PROFILE_TABLE = quoteIdent("user_profile");
+const UPLOAD_CHUNKS_TABLE = quoteIdent("upload_chunks");
 const HNSW_INDEX = quoteIdent(`${config.db.table}_embedding_hnsw_idx`);
 const TSV_INDEX = quoteIdent(`${config.db.table}_tsv_gin_idx`);
 const DOC_INDEX = quoteIdent(`${config.db.table}_doc_id_idx`);
@@ -280,6 +281,34 @@ async function ensureSchema() {
         updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+
+    // ---------------------------------------------------------------------
+    // Chunked upload staging.
+    //
+    // Vercel serverless functions cap request bodies at 4.5 MB, so PDFs
+    // larger than that are uploaded as ≤4 MB chunks. Each chunk is staged
+    // here; the final chunk's request reassembles the bytes, runs the
+    // existing indexing pipeline, and deletes the staged rows. Rows are
+    // self-cleaning: anything older than the TTL is purged on each insert
+    // so an abandoned upload never persists.
+    // ---------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ${UPLOAD_CHUNKS_TABLE} (
+        upload_id     UUID NOT NULL,
+        chunk_index   INT NOT NULL,
+        total_chunks  INT NOT NULL,
+        filename      TEXT NOT NULL,
+        user_id       TEXT NOT NULL,
+        session_id    UUID,
+        data          BYTEA NOT NULL,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (upload_id, chunk_index)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS upload_chunks_created_at_idx
+        ON ${UPLOAD_CHUNKS_TABLE} (created_at)
+    `);
   });
   log.info(
     {
@@ -338,6 +367,7 @@ module.exports = {
   MEMORY_TABLE,
   FAVORITES_TABLE,
   USER_PROFILE_TABLE,
+  UPLOAD_CHUNKS_TABLE,
   // Back-compat alias used by older modules.
   TABLE: CHUNKS_TABLE,
   quoteIdent,

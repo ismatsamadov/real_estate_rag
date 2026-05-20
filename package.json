@@ -14,7 +14,6 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",
-    "@vercel/blob": "^2.4.0",
     "lru-cache": "^11.0.2",
     "next": "^15.5.18",
     "pdfjs-dist": "^5.7.284",

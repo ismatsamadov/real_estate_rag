@@ -1,22 +1,15 @@
 /**
  * GET  /api/documents?sessionId=<uuid>  — list uploaded docs in that session
- * POST /api/documents                   — index a previously-uploaded PDF
+ * POST /api/documents                   — one-shot multipart upload of a PDF
  *
- *   JSON body (preferred — bypasses Vercel's 4.5 MB function body cap):
- *     { blobUrl: string, sessionId?: uuid }
- *
- *     The client first PUTs the PDF straight to Vercel Blob via
- *     /api/documents/upload-token, then POSTs the resulting blob URL here.
- *     We fetch the blob server-side, run the existing extract→chunk→embed
- *     pipeline, and delete the blob (we don't keep PDFs in blob storage).
- *
- *   Multipart fallback (kept so small dev uploads still work without a
- *   Blob store configured):
- *     file       (the PDF binary, ≤ 10 MB — note: Vercel caps this at ~4.5 MB)
- *     sessionId  (UUID — created in advance via /api/sessions or auto-created)
+ *   Form fields:
+ *     file       (the PDF binary; must fit under Vercel's ~4.5 MB function
+ *                 body cap — the client routes larger files through
+ *                 /api/documents/chunk instead)
+ *     sessionId  (UUID — created in advance via /api/sessions or
+ *                 auto-created here)
  */
 import { NextResponse } from "next/server";
-import { del as deleteBlob } from "@vercel/blob";
 import { getUserId } from "../_auth";
 import { classifyError } from "../../../src/errors";
 
@@ -30,7 +23,9 @@ export const maxDuration = 300;
 export const dynamic = "force-dynamic";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+// Vercel caps function bodies at ~4.5 MB; we leave a bit of headroom. The
+// chunked upload route handles anything bigger.
+const MAX_SIZE_BYTES = 4 * 1024 * 1024;
 const ALLOWED_TYPES = new Set([
   "application/pdf",
   "application/x-pdf",
@@ -55,142 +50,19 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const userId = getUserId(req);
 
-  // Branch on Content-Type: JSON body = blob-URL flow, multipart = legacy.
-  const contentType = req.headers.get("content-type") || "";
-  const isJson = contentType.includes("application/json");
-
-  let sessionIdInput = "";
-  let filename = "document.pdf";
-  let buffer: Buffer;
-  let blobUrlToDelete: string | null = null;
-
-  if (isJson) {
-    // ---- Blob-URL flow ----
-    let body: { blobUrl?: string; sessionId?: string };
-    try {
-      body = await req.json();
-    } catch {
-      return NextResponse.json(
-        { ok: false, error: "Invalid JSON body." },
-        { status: 400 },
-      );
-    }
-
-    const blobUrl = String(body.blobUrl || "").trim();
-    if (!blobUrl) {
-      return NextResponse.json(
-        { ok: false, error: "blobUrl is required" },
-        { status: 400 },
-      );
-    }
-    // Lock the host to Vercel Blob to prevent SSRF via an attacker-controlled URL.
-    let parsed: URL;
-    try {
-      parsed = new URL(blobUrl);
-    } catch {
-      return NextResponse.json({ ok: false, error: "Invalid blobUrl" }, { status: 400 });
-    }
-    if (!/\.public\.blob\.vercel-storage\.com$/i.test(parsed.hostname)) {
-      return NextResponse.json(
-        { ok: false, error: "blobUrl must be a Vercel Blob URL" },
-        { status: 400 },
-      );
-    }
-
-    sessionIdInput = String(body.sessionId || "").trim();
-    blobUrlToDelete = blobUrl;
-
-    // Fetch the PDF from blob storage (server-side, on Vercel's network).
-    const fetched = await fetch(blobUrl);
-    if (!fetched.ok) {
-      return NextResponse.json(
-        { ok: false, error: `Could not read upload (HTTP ${fetched.status})` },
-        { status: 502 },
-      );
-    }
-    const ab = await fetched.arrayBuffer();
-    buffer = Buffer.from(ab);
-
-    if (buffer.length === 0) {
-      return NextResponse.json({ ok: false, error: "Empty file" }, { status: 400 });
-    }
-    if (buffer.length > MAX_SIZE_BYTES) {
-      // Defense in depth — handleUpload already enforces this on the token.
-      return NextResponse.json(
-        {
-          ok: false,
-          error: `File is ${(buffer.length / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_SIZE_BYTES / 1024 / 1024} MB.`,
-        },
-        { status: 413 },
-      );
-    }
-
-    const ctype = fetched.headers.get("content-type") || "";
-    const pathFilename = decodeURIComponent(parsed.pathname.split("/").pop() || "");
-    filename = pathFilename || filename;
-    const looksPdf =
-      ALLOWED_TYPES.has(ctype) || filename.toLowerCase().endsWith(".pdf");
-    if (!looksPdf) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: `Only PDF uploads are supported right now. Got "${ctype || "unknown"}".`,
-        },
-        { status: 415 },
-      );
-    }
-  } else {
-    // ---- Multipart fallback (small files / no Blob store configured) ----
-    let form: FormData;
-    try {
-      form = await req.formData();
-    } catch {
-      return NextResponse.json(
-        { ok: false, error: "Invalid multipart form data." },
-        { status: 400 },
-      );
-    }
-
-    sessionIdInput = String(form.get("sessionId") || "").trim();
-
-    const file = form.get("file");
-    if (!file || typeof file === "string") {
-      return NextResponse.json(
-        { ok: false, error: "file is required (multipart field 'file')" },
-        { status: 400 },
-      );
-    }
-    const blob = file as File;
-    if (blob.size === 0) {
-      return NextResponse.json({ ok: false, error: "Empty file" }, { status: 400 });
-    }
-    if (blob.size > MAX_SIZE_BYTES) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: `File is ${(blob.size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_SIZE_BYTES / 1024 / 1024} MB.`,
-        },
-        { status: 413 },
-      );
-    }
-    const looksPdf =
-      ALLOWED_TYPES.has(blob.type) ||
-      blob.name?.toLowerCase().endsWith(".pdf");
-    if (!looksPdf) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: `Only PDF uploads are supported right now. Got "${blob.type || "unknown"}".`,
-        },
-        { status: 415 },
-      );
-    }
-    filename = blob.name || filename;
-    buffer = Buffer.from(await blob.arrayBuffer());
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return NextResponse.json(
+      { ok: false, error: "Invalid multipart form data." },
+      { status: 400 },
+    );
   }
 
-  // ---- Validate sessionId (shared by both flows) ----
-  if (sessionIdInput && !UUID_RE.test(sessionIdInput)) {
+  // ---- Validate sessionId ----
+  let sessionId = String(form.get("sessionId") || "").trim();
+  if (sessionId && !UUID_RE.test(sessionId)) {
     return NextResponse.json(
       { ok: false, error: "sessionId must be a UUID" },
       { status: 400 },
@@ -202,7 +74,6 @@ export async function POST(req: Request) {
   // the user's first message can set it via appendUserMessage —
   // appendUserMessage only sets title when it's null, so a hard-coded
   // placeholder like "New chat" would block the natural title forever.
-  let sessionId = sessionIdInput;
   if (!sessionId) {
     const created = await sessions.createSession(userId, { title: null });
     sessionId = created.session_id;
@@ -216,10 +87,47 @@ export async function POST(req: Request) {
     }
   }
 
+  // ---- Validate file ----
+  const file = form.get("file");
+  if (!file || typeof file === "string") {
+    return NextResponse.json(
+      { ok: false, error: "file is required (multipart field 'file')" },
+      { status: 400 },
+    );
+  }
+  const blob = file as File;
+  if (blob.size === 0) {
+    return NextResponse.json({ ok: false, error: "Empty file" }, { status: 400 });
+  }
+  if (blob.size > MAX_SIZE_BYTES) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: `File is ${(blob.size / 1024 / 1024).toFixed(1)} MB; this endpoint caps at ${MAX_SIZE_BYTES / 1024 / 1024} MB. Bigger files should be sent via /api/documents/chunk.`,
+      },
+      { status: 413 },
+    );
+  }
+  // Some browsers don't send a Content-Type for PDFs; fall back to extension.
+  const looksPdf =
+    ALLOWED_TYPES.has(blob.type) ||
+    blob.name?.toLowerCase().endsWith(".pdf");
+  if (!looksPdf) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: `Only PDF uploads are supported right now. Got "${blob.type || "unknown"}".`,
+      },
+      { status: 415 },
+    );
+  }
+
+  const buffer = Buffer.from(await blob.arrayBuffer());
+
   // ---- Extract + chunk + embed + persist ----
   try {
     const result = await documents.indexUploadedPdf(userId, sessionId, {
-      filename,
+      filename: blob.name || "document.pdf",
       buffer,
     });
     return NextResponse.json({ ok: true, sessionId, document: result });
@@ -234,12 +142,5 @@ export async function POST(req: Request) {
       },
       { status: cls.status || 500 },
     );
-  } finally {
-    // The PDF is now persisted as chunks in Postgres; the blob is no
-    // longer needed. Best-effort delete — leaving an orphan blob is not
-    // worth failing the request for.
-    if (blobUrlToDelete) {
-      deleteBlob(blobUrlToDelete).catch(() => {});
-    }
   }
 }

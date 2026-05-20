@@ -1376,6 +1376,7 @@ Three secrets are required; everything else has a sensible default in
 | `VOYAGE_AI_API_KEY` | — (required) | Voyage AI (alias: `VOYAGE_API_KEY`) |
 | `DEMO_USERNAME` | — (required) | Login |
 | `DEMO_PASSWORD` | — (≥ 8 chars, required) | Login |
+| `BLOB_READ_WRITE_TOKEN` | — (required for PDF upload on Vercel) | Vercel Blob token — PDFs >4.5 MB upload through Blob to bypass the serverless body cap. Auto-injected when a Blob store is linked to the project; for local dev: `vercel env pull` |
 | `VOYAGE_EMBED_MODEL` | `voyage-4-large` | Embedding model (must match `VECTOR_DIM`) |
 | `VOYAGE_RERANK_MODEL` | `rerank-2.5` | Cross-encoder reranker |
 | `VECTOR_DIM` | `1024` | Vector dimensions |

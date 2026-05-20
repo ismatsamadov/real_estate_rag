@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { upload } from "@vercel/blob/client";
 import { useFavorites } from "./FavoritesContext";
 
 type MemoryChip = {
@@ -282,15 +283,28 @@ export default function ChatView({
       };
       setUploadedDocs((prev) => [placeholder, ...prev]);
 
-      const form = new FormData();
-      form.append("file", file);
-      if (sessionId) form.append("sessionId", sessionId);
-
       try {
+        // Step 1: PUT the PDF straight to Vercel Blob. This sidesteps
+        // Vercel's 4.5 MB serverless body cap — the browser uploads
+        // directly to blob storage using a short-lived token minted by
+        // /api/documents/upload-token.
+        const blob = await upload(file.name, file, {
+          access: "public",
+          handleUploadUrl: "/api/documents/upload-token",
+          contentType: file.type || "application/pdf",
+        });
+
+        // Step 2: hand the blob URL to the indexing endpoint. The server
+        // fetches it, runs the extract→chunk→embed pipeline, then deletes
+        // the blob — we don't keep PDFs in blob storage.
         const resp = await fetch("/api/documents", {
           method: "POST",
-          body: form,
           credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            blobUrl: blob.url,
+            ...(sessionId ? { sessionId } : {}),
+          }),
         });
         const data = await resp.json();
         if (!resp.ok || !data?.ok) {

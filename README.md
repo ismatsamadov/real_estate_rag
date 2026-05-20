@@ -106,7 +106,8 @@ vectors or 1k+ QPS. Below that, the split costs more than it earns:
   expression. Pinecone's metadata filter is limited to equality and basic
   range; complex filters fall back to client-side post-filtering.
 - **Operational simplicity.** One backup, one ACL system, one connection
-  pool. Adding chat history (Stage 12) and cross-session memory (Stage 16)
+  pool. Adding [multi-turn chat](#10-multi-turn-chat--sessions-messages-in-session-history)
+  and [cross-session memory](#11-cross-session-memory--rag-over-conversation-history)
   was just two more tables in the same DB — no new infra.
 
 The migration path is clear: if we hit ~10M vectors with acceptable HNSW
@@ -237,27 +238,36 @@ extraction path is well-trodden.
 
 ## Table of contents
 
-1. [How a question gets answered](#how-a-question-gets-answered)
-2. [Build log — stage by stage](#build-log--stage-by-stage)
-   - [Stage 1 — Infra: Neon and Voyage](#stage-1--infra-neon-and-voyage)
-   - [Stage 2 — Scraping the whole site](#stage-2--scraping-the-whole-site)
-   - [Stage 3 — Listing-aware chunking](#stage-3--listing-aware-chunking)
-   - [Stage 4 — Voyage embeddings](#stage-4--voyage-embeddings)
-   - [Stage 5 — First full ingest](#stage-5--first-full-ingest)
-   - [Stage 6 — Hybrid retrieval + rerank + cache](#stage-6--hybrid-retrieval--rerank--cache)
-   - [Stage 7 — Generation hardening](#stage-7--generation-hardening)
-   - [Stage 8 — Honest evaluation](#stage-8--honest-evaluation)
-   - [Stage 9 — Next.js frontend](#stage-9--nextjs-frontend)
-   - [Stage 12–15 — Persistent chat](#stage-1215--persistent-chat)
-   - [Stage 16 — Cross-session memory](#stage-16--cross-session-memory)
-   - [Stage 17 — Edge case audit](#stage-17--edge-case-audit)
-   - [Stage 18–19 — Self-documenting schema](#stage-1819--self-documenting-schema)
-   - [Stage 20 — Real user feedback: the "otaqlı" bug](#stage-20--real-user-feedback-the-otaqlı-bug)
-   - [Stage 21 — Favorites](#stage-21--favorites)
-   - [Stage 22-26 — Hardening pass (glossary, errors, mobile, PDF upload)](#stage-22-26--hardening-pass-glossary-errors-mobile-pdf-upload)
-   - [Stage 27 — Self-bootstrapping schema, CLI removal](#stage-27--self-bootstrapping-schema-cli-removal)
-   - [Stage 28 — Persistent user-intent profile](#stage-28--persistent-user-intent-profile)
-   - [Stage 29 — Uploads library, session rename, ghost-session filter](#stage-29--uploads-library-session-rename-ghost-session-filter)
+1. [How a question gets answered](#how-a-question-gets-answered) — end-to-end query trace
+2. [How the system works — stage by stage](#how-the-system-works--stage-by-stage) — pipeline tour
+   - **Data**
+     - [1. Data foundation — Neon Postgres + Voyage AI](#1-data-foundation--neon-postgres--voyage-ai)
+     - [2. The corpus — scraping pasharealestate.az](#2-the-corpus--scraping-pasharealestateaz)
+     - [3. Chunking — listing-aware splitting + metadata extraction](#3-chunking--listing-aware-splitting--metadata-extraction)
+     - [4. Embeddings — Voyage `voyage-4-large` asymmetric](#4-embeddings--voyage-voyage-4-large-asymmetric)
+     - [5. Indexing — ingest pipeline + idempotent upserts](#5-indexing--ingest-pipeline--idempotent-upserts)
+   - **Query**
+     - [6. Retrieval — hybrid (vector + FTS) + RRF + rerank + cache](#6-retrieval--hybrid-vector--fts--rrf--rerank--cache)
+     - [7. Generation — citation contract + Claude streaming](#7-generation--citation-contract--claude-streaming)
+     - [8. Evaluation — LLM-as-judge, multilingual harness](#8-evaluation--llm-as-judge-multilingual-harness)
+   - **UX**
+     - [9. Frontend — Next.js + auth + premium UI + mobile](#9-frontend--nextjs--auth--premium-ui--mobile)
+   - **Multi-turn**
+     - [10. Multi-turn chat — sessions, messages, in-session history](#10-multi-turn-chat--sessions-messages-in-session-history)
+     - [11. Cross-session memory — RAG over conversation history](#11-cross-session-memory--rag-over-conversation-history)
+   - **Operations**
+     - [12. Hardening — auth, validation, security headers, edge cases](#12-hardening--auth-validation-security-headers-edge-cases)
+     - [13. Self-documenting schema — `COMMENT ON` every column + ERD](#13-self-documenting-schema--comment-on-every-column--erd)
+   - **Domain features**
+     - [14. Multilingual — EN / AZ / RU + post-Soviet room conventions](#14-multilingual--en--az--ru--post-soviet-room-conventions)
+     - [15. Saved listings — favorites with cascading cleanup](#15-saved-listings--favorites-with-cascading-cleanup)
+     - [16. PDF upload + on-the-fly RAG — bring your own document](#16-pdf-upload--on-the-fly-rag--bring-your-own-document)
+   - **Operations II**
+     - [17. Self-bootstrapping — Next.js instrumentation hook](#17-self-bootstrapping--nextjs-instrumentation-hook)
+   - **Personalization**
+     - [18. User-intent profile — LLM-synthesized personalization](#18-user-intent-profile--llm-synthesized-personalization)
+   - **CRUD completeness**
+     - [19. CRUD over chat data — sessions, profile, uploads, memory](#19-crud-over-chat-data--sessions-profile-uploads-memory)
 3. [Quick start](#quick-start)
 4. [Eval results](#eval-results)
 5. [Configuration](#configuration)
@@ -323,16 +333,21 @@ sequenceDiagram
 
 ---
 
-# Build log — stage by stage
+# How the system works — stage by stage
 
-Each stage below answers the same three questions:
-- **What** — the concrete code change
-- **Why** — what problem it solves
+Pipeline tour, ordered as a question travels through the system: data
+foundation → indexing → query → answer → multi-turn → personalization →
+UX → operations → quality. **Not** the chronological order in which
+features were built.
+
+Each section answers the same three questions:
+- **What** — the concrete code surface
+- **Why** — the problem it solves
 - **How** — the specific approach with files to read
 
 ---
 
-## Stage 1 — Infra: Neon and Voyage
+## 1. Data foundation — Neon Postgres + Voyage AI
 
 **Files:** [`src/db.js`](src/db.js) · [`src/config.js`](src/config.js) · [`scripts/migrate.js`](scripts/migrate.js)
 
@@ -365,7 +380,7 @@ startup so a fresh database deploy fails fast if the keys are wrong.
 
 ---
 
-## Stage 2 — Scraping the whole site
+## 2. The corpus — scraping pasharealestate.az
 
 **Files:** [`scripts/scrape.js`](scripts/scrape.js)
 
@@ -403,7 +418,7 @@ empirical, not declarative.
 
 ---
 
-## Stage 3 — Listing-aware chunking
+## 3. Chunking — listing-aware splitting + metadata extraction
 
 **Files:** [`src/chunker.js`](src/chunker.js)
 
@@ -433,11 +448,11 @@ emits a chunk over the hard `CHUNK_SIZE` ceiling.
 
 There's a subtle multilingual bug I learned the hard way: my first
 extractor used `/otaq/i` which matched both `otaqlı` (total rooms) and
-`yataq otaqlı` (bedrooms). That's covered in [Stage 20](#stage-20--real-user-feedback-the-otaqlı-bug).
+`yataq otaqlı` (bedrooms). That's covered in [section 14](#14-multilingual--en--az--ru--post-soviet-room-conventions).
 
 ---
 
-## Stage 4 — Voyage embeddings
+## 4. Embeddings — Voyage `voyage-4-large` asymmetric
 
 **Files:** [`src/embedder.js`](src/embedder.js)
 
@@ -467,7 +482,7 @@ requests so the throttle is process-wide, not per-call.
 
 ---
 
-## Stage 5 — First full ingest
+## 5. Indexing — ingest pipeline + idempotent upserts
 
 **Files:** [`scripts/ingest.js`](scripts/ingest.js)
 
@@ -507,7 +522,7 @@ and GIN(metadata jsonb) indexes built.**
 
 ---
 
-## Stage 6 — Hybrid retrieval + rerank + cache
+## 6. Retrieval — hybrid (vector + FTS) + RRF + rerank + cache
 
 **Files:** [`src/retriever.js`](src/retriever.js)
 
@@ -562,7 +577,7 @@ the UI can show a "cache hit" pill.
 
 ---
 
-## Stage 7 — Generation hardening
+## 7. Generation — citation contract + Claude streaming
 
 **Files:** [`src/llm.js`](src/llm.js) · [`src/prompt.js`](src/prompt.js)
 
@@ -600,7 +615,7 @@ model. Treating those the same way would mask real errors.
 
 ---
 
-## Stage 8 — Honest evaluation
+## 8. Evaluation — LLM-as-judge, multilingual harness
 
 **Files:** [`scripts/eval.js`](scripts/eval.js) · [`eval/eval-set.jsonl`](eval/eval-set.jsonl) · [`eval/results-*.md`](eval/)
 
@@ -670,7 +685,7 @@ knowledge about Marriott / Ritz-Carlton. They're listed by name in
 
 ---
 
-## Stage 9 — Next.js frontend
+## 9. Frontend — Next.js + auth + premium UI + mobile
 
 **Files:** [`app/`](app/)
 
@@ -718,7 +733,7 @@ sees the system handles EN / AZ / RU on the first interaction.
 
 ---
 
-## Stage 12–15 — Persistent chat
+## 10. Multi-turn chat — sessions, messages, in-session history
 
 **Files:** [`src/db.js`](src/db.js) (schema) · [`src/sessions.js`](src/sessions.js) (data layer) · [`app/api/sessions/`](app/api/sessions/) (CRUD) · [`app/components/ChatShell.tsx`](app/components/ChatShell.tsx) · [`app/components/Sidebar.tsx`](app/components/Sidebar.tsx) · [`app/components/ChatView.tsx`](app/components/ChatView.tsx)
 
@@ -791,7 +806,7 @@ shift — the audit trail decouples from the live corpus.
 
 ---
 
-## Stage 16 — Cross-session memory
+## 11. Cross-session memory — RAG over conversation history
 
 **Files:** [`src/memory.js`](src/memory.js) · [`app/api/memory/route.ts`](app/api/memory/route.ts)
 
@@ -850,7 +865,7 @@ prompt enforces).
 
 ---
 
-## Stage 17 — Edge case audit
+## 12. Hardening — auth, validation, security headers, edge cases
 
 **Files:** the `next.config.js` headers config; verified against every API
 route.
@@ -892,7 +907,7 @@ present. Added `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
 
 ---
 
-## Stage 18–19 — Self-documenting schema
+## 13. Self-documenting schema — `COMMENT ON` every column + ERD
 
 **Files:** [`scripts/comment-schema.js`](scripts/comment-schema.js) · [`docs/database.md`](docs/database.md)
 
@@ -928,7 +943,7 @@ relationship ERD, cascade matrix, common debugging queries, the
 
 ---
 
-## Stage 20 — Real user feedback: the "otaqlı" bug
+## 14. Multilingual — EN / AZ / RU + post-Soviet room conventions
 
 **Files:** [`src/rag.js`](src/rag.js) (preprocessor + LLM rewriter) · [`src/prompt.js`](src/prompt.js) (system prompt)
 
@@ -986,7 +1001,7 @@ reappears, the next `npm run eval` will name it as a failure.
 
 ---
 
-## Stage 21 — Favorites
+## 15. Saved listings — favorites with cascading cleanup
 
 **Files:** [`src/favorites.js`](src/favorites.js) · [`app/api/favorites/`](app/api/favorites/) · [`app/components/FavoritesContext.tsx`](app/components/FavoritesContext.tsx) · [`app/components/SavedModal.tsx`](app/components/SavedModal.tsx)
 
@@ -1039,45 +1054,79 @@ Cascade behavior:
 
 ---
 
-## Stage 22-26 — Hardening pass (glossary, errors, mobile, PDF upload)
+## 16. PDF upload + on-the-fly RAG — bring your own document
 
-A consolidated tightening of everything user-facing:
+**Files:** [`src/documents.js`](src/documents.js) · [`src/pdf.js`](src/pdf.js) · [`app/api/documents/`](app/api/documents/) · [`app/api/uploads/`](app/api/uploads/) · [`app/uploads/`](app/uploads/)
 
-- **Stage 22-23 — Glossary**: every technical term referenced in this
-  README has a dedicated [`docs/*.md`](docs/) deep-dive. 27 entries:
-  RAG, [HNSW](docs/hnsw.md), [pgvector](docs/pgvector.md),
-  [RRF](docs/rrf.md), [MTEB](docs/mteb.md),
-  [cross-encoder rerank](docs/cross-encoder-rerank.md),
-  [tsvector/FTS](docs/tsvector-fts.md), [GIN](docs/gin-index.md),
-  [JSONB](docs/jsonb.md), [CTE](docs/cte.md),
-  [SSE](docs/sse-streaming.md),
-  [LRU](docs/lru-cache.md), [TTL](docs/ttl.md),
-  [SHA-256](docs/sha-256.md), [UUID](docs/uuid.md),
-  [BIGSERIAL](docs/serial-types.md), [ANALYZE](docs/analyze.md),
-  [foreign keys (CASCADE/SET NULL)](docs/foreign-keys.md),
-  [cookie security](docs/cookie-security.md),
-  [idempotency](docs/idempotency.md), and more. Index in
-  [`docs/glossary.md`](docs/glossary.md).
-- **Stage 24 — Friendly Anthropic errors**: 13-kind error classifier in
-  [`src/errors.js`](src/errors.js) — billing exhausted, auth, rate
-  limit (429), overloaded (529), validation, request-too-large,
-  model-unavailable (404), timeout, network, server, db, aborted,
-  unknown. Each kind has a user-facing message and a retry hint.
-- **Stage 25 — Mobile responsive**: 100svh viewports, safe-area insets
-  for iPhone notch / home bar, 16px input font to suppress iOS zoom,
-  per-row hover states swapped for always-visible affordances on touch.
-- **Stage 26 — PDF upload + on-the-fly RAG**: drop a PDF onto any chat
-  → extract pages via `pdfjs-dist` → chunk per page → embed with
-  Voyage → upsert into `documents` + `rag_chunks` with `session_id`
-  denormalized. Retrieval filters with
-  `c.session_id IS NULL OR c.session_id = $sid` so uploads ride the
-  same hybrid pipeline as the public corpus. The meta-document path
-  (`"analyse this doc"`) bypasses relevance ranking and feeds a
-  stride-sampled slice instead.
+### What
+Drop a PDF onto any chat (paperclip in the composer, ≤10 MB). The
+server extracts text page-by-page with `pdfjs-dist`, chunks each page,
+embeds the chunks with Voyage (same model as the public corpus), and
+upserts them into `documents` + `rag_chunks` with `session_id`
+denormalized so retrieval can scope per-session.
+
+A dedicated `/uploads` library page lists every PDF the user has
+uploaded across every session, with per-row delete (cascades to
+embeddings via the FK).
+
+### Why
+PASHA Real Estate's near-term opportunity is **document AI** —
+contracts, brochures, building specifications. A user shouldn't have
+to wait for the corpus to be re-scraped to ask "what does this
+brochure say about parking?". Bring-your-own-document RAG turns the
+same retrieval/generation pipeline into a contract analyzer, a
+brochure reader, or an annual-report Q&A box.
+
+### How
+```mermaid
+flowchart LR
+  P[PDF upload] --> EX[pdfjs-dist extract<br/>per page]
+  EX --> CH[chunkText per page<br/>≤20 chunks/page]
+  CH --> E[Voyage embed<br/>inputType=document]
+  E --> S[(documents + rag_chunks<br/>session_id denormalized)]
+  Q[User question this session] --> R[retriever]
+  S --> R
+  R -->|session_id IS NULL OR<br/>session_id = $sid| Hyb[Hybrid + rerank]
+  Hyb --> A[Claude with citations]
+```
+
+Hard caps: 400 pages, 500k chars, 20 chunks per page, ≤10 MB. Caps
+exist so a giant PDF can't blow the Voyage budget or function memory.
+
+**Meta-document detection.** When the question is *about the document
+as a whole* (`"analyse this doc"`, `"summarize the PDF"`,
+`"what's in this contract?"`), keyword retrieval would surface random
+chunks matching "analyse." `looksLikeMetaDocQuery` in
+[`src/rag.js`](src/rag.js) detects this pattern and bypasses
+relevance ranking, instead fetching a **stride-sampled slice** (first /
+middle / last) of the session's uploaded chunks. Verified end-to-end
+with a 174-page PASHA Bank Annual Report PDF → coherent 7-section
+analysis including a self-aware "Limitations" section.
+
+### Cascade behavior
+- Delete the document via the library or session sidebar →
+  `ON DELETE CASCADE` wipes its chunks. Past chat citations stay
+  visible (`messages.sources` JSONB is frozen by design).
+- Delete the session → its uploads cascade-delete too.
+- Re-upload the same file → idempotent (content hash dedup), updates
+  the existing chunks.
+
+### Related hardening that landed alongside
+- **Friendly Anthropic errors**: [`src/errors.js`](src/errors.js) is a
+  13-kind classifier (`billing`, `auth`, `rate_limit`, `overloaded`,
+  `validation`, `request_too_large`, `model_unavailable`, `timeout`,
+  `network`, `server`, `db`, `aborted`, `unknown`). Each kind has a
+  user-facing message and a retry hint. The streaming endpoint emits
+  the classified error as a `{type:"error", kind}` SSE event and the
+  UI shows a human-readable banner with a Retry button.
+- **Mobile responsive**: 100svh viewport units, safe-area insets for
+  iPhone notch + home bar, 16px input font to suppress iOS zoom,
+  per-row hover states swapped for always-visible affordances on
+  touch.
 
 ---
 
-## Stage 27 — Self-bootstrapping schema, CLI removal
+## 17. Self-bootstrapping — Next.js instrumentation hook
 
 **Files:** [`instrumentation.ts`](instrumentation.ts) · [`instrumentation-node.ts`](instrumentation-node.ts) · [`src/db.js`](src/db.js)
 
@@ -1126,7 +1175,7 @@ running schema migrations on Node cold boots. Boot log:
 
 ---
 
-## Stage 28 — Persistent user-intent profile
+## 18. User-intent profile — LLM-synthesized personalization
 
 **Files:** [`src/profile.js`](src/profile.js) · [`src/prompt.js`](src/prompt.js) · [`src/rag.js`](src/rag.js) · [`app/api/profile/`](app/api/profile/) · [`app/components/Sidebar.tsx`](app/components/Sidebar.tsx) · [`docs/user-profile.md`](docs/user-profile.md) · [`docs/personalization.md`](docs/personalization.md)
 
@@ -1208,7 +1257,7 @@ against the corpus (`[Sn]` citations) but framed by the profile.
 
 ---
 
-## Stage 29 — Uploads library, session rename, ghost-session filter
+## 19. CRUD over chat data — sessions, profile, uploads, memory
 
 **Files:** [`src/documents.js`](src/documents.js) · [`src/sessions.js`](src/sessions.js) · [`app/uploads/`](app/uploads/) · [`app/components/UploadsView.tsx`](app/components/UploadsView.tsx) · [`app/components/Sidebar.tsx`](app/components/Sidebar.tsx)
 

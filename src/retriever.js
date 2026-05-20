@@ -40,7 +40,7 @@ const cache = config.retrieval.cacheTtlMs > 0
     })
   : null;
 
-function cacheKey({ q, mode, topK, candidateK, doRerank, filters, sessionId }) {
+function cacheKey({ q, mode, topK, candidateK, doRerank, filters, userId }) {
   return JSON.stringify({
     q: q.toLowerCase().replace(/\s+/g, " ").trim(),
     mode,
@@ -48,7 +48,10 @@ function cacheKey({ q, mode, topK, candidateK, doRerank, filters, sessionId }) {
     candidateK,
     doRerank,
     filters,
-    sessionId: sessionId || null,
+    // userId scopes retrieval (own uploads + public corpus), so it must
+    // be part of the cache key — otherwise one user's cached results
+    // could be served to another. Public-only queries cache under null.
+    userId: userId || null,
   });
 }
 
@@ -119,17 +122,21 @@ function buildFilterClause(filters, startIdx = 1) {
   };
 }
 
-// Session-scope clause. The corpus is "public" (session_id IS NULL) by
-// default. When the caller provides a sessionId, we also include any
-// chunks uploaded for THAT session — so the user's PDF gets retrieved
-// alongside the public corpus, and never sees other users' uploads.
-function buildSessionScopeClause(sessionId, startIdx = 1) {
-  if (!sessionId) {
+// Ownership-scope clause. The corpus is "public" (session_id IS NULL) by
+// default. When the caller provides a userId, we also include chunks from
+// ANY session that user owns — so a PDF uploaded in one chat is reachable
+// from every other chat that user opens, but invisible to other users.
+// The sub-select is keyed by the (user_id, updated_at DESC) index on
+// sessions, so it's cheap.
+function buildOwnershipScopeClause(userId, startIdx = 1) {
+  if (!userId) {
     return { clause: `AND c.session_id IS NULL`, values: [], nextParam: startIdx };
   }
   return {
-    clause: `AND (c.session_id IS NULL OR c.session_id = $${startIdx}::uuid)`,
-    values: [sessionId],
+    clause: `AND (c.session_id IS NULL OR c.session_id IN (
+              SELECT session_id FROM ${db.SESSIONS_TABLE} WHERE user_id = $${startIdx}::text
+            ))`,
+    values: [userId],
     nextParam: startIdx + 1,
   };
 }
@@ -138,13 +145,13 @@ function buildSessionScopeClause(sessionId, startIdx = 1) {
 // Search SQL
 // ---------------------------------------------------------------------------
 
-async function hybridSearch({ qv, qt, candidateK, rrfK, filters, sessionId }) {
-  // The filter + session scope clauses are referenced twice (once per
+async function hybridSearch({ qv, qt, candidateK, rrfK, filters, userId }) {
+  // The filter + ownership scope clauses are referenced twice (once per
   // subquery). pg's positional $N binding means we duplicate the values
   // with two distinct parameter offsets.
-  const s1 = buildSessionScopeClause(sessionId, 5);
+  const s1 = buildOwnershipScopeClause(userId, 5);
   const f1 = buildFilterClause(filters, s1.nextParam);
-  const s2 = buildSessionScopeClause(sessionId, f1.nextParam);
+  const s2 = buildOwnershipScopeClause(userId, f1.nextParam);
   const f2 = buildFilterClause(filters, s2.nextParam);
 
   const sql = `
@@ -209,8 +216,8 @@ async function hybridSearch({ qv, qt, candidateK, rrfK, filters, sessionId }) {
   return rows;
 }
 
-async function vectorSearch({ qv, candidateK, filters, sessionId }) {
-  const sc = buildSessionScopeClause(sessionId, 3);
+async function vectorSearch({ qv, candidateK, filters, userId }) {
+  const sc = buildOwnershipScopeClause(userId, 3);
   const ff = buildFilterClause(filters, sc.nextParam);
   const sql = `
     SELECT
@@ -227,8 +234,8 @@ async function vectorSearch({ qv, candidateK, filters, sessionId }) {
   return rows;
 }
 
-async function lexicalSearch({ qt, candidateK, filters, sessionId }) {
-  const sc = buildSessionScopeClause(sessionId, 3);
+async function lexicalSearch({ qt, candidateK, filters, userId }) {
+  const sc = buildOwnershipScopeClause(userId, 3);
   const ff = buildFilterClause(filters, sc.nextParam);
   const sql = `
     SELECT
@@ -317,11 +324,12 @@ async function retrieve(question, opts = {}) {
   const candidateK = Math.max(topK, opts.candidateK ?? config.retrieval.candidateK);
   const doRerank = opts.rerank ?? config.retrieval.rerank;
   const filters = opts.filters || null;
-  const sessionId = opts.sessionId || null;
+  const userId = opts.userId || null;
 
-  // Cache check — include sessionId in the key so uploaded-doc queries
-  // don't share a cache entry with public-corpus queries.
-  const key = cacheKey({ q, mode, topK, candidateK, doRerank, filters, sessionId });
+  // Cache check — include userId in the key so one user's uploaded-doc
+  // results never get served to a different user, and so public-corpus
+  // queries (no userId) cache separately.
+  const key = cacheKey({ q, mode, topK, candidateK, doRerank, filters, userId });
   if (cache) {
     const hit = cache.get(key);
     if (hit) {
@@ -335,10 +343,10 @@ async function retrieve(question, opts = {}) {
   let fallback = null;
 
   if (mode === "lexical") {
-    rows = await lexicalSearch({ qt: q, candidateK, filters, sessionId });
+    rows = await lexicalSearch({ qt: q, candidateK, filters, userId });
   } else if (mode === "vector") {
     const qv = toVectorLiteral(await embed(q, "query"));
-    rows = await vectorSearch({ qv, candidateK, filters, sessionId });
+    rows = await vectorSearch({ qv, candidateK, filters, userId });
   } else {
     // hybrid
     const qv = toVectorLiteral(await embed(q, "query"));
@@ -348,13 +356,13 @@ async function retrieve(question, opts = {}) {
       candidateK,
       rrfK: config.retrieval.rrfK,
       filters,
-      sessionId,
+      userId,
     });
     if (!rows.length) {
       // Lexical query may have been empty (stop-words only) or matched
       // nothing under the current filters. Fall back to pure vector.
       log.info({ q: q.slice(0, 80) }, "hybrid empty -> falling back to vector");
-      rows = await vectorSearch({ qv, candidateK, filters, sessionId });
+      rows = await vectorSearch({ qv, candidateK, filters, userId });
       usedMode = "vector";
       fallback = "lexical-empty";
     }

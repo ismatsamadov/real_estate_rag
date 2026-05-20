@@ -38,27 +38,52 @@ function looksLikeMetaDocQuery(question) {
 }
 
 /**
- * Fetch a representative slice of all uploaded chunks for this session.
- * Stride-samples so a 100-chunk doc gives ~8 chunks spread across the
- * whole document — first, several from middle, last. No vector/lexical
- * scoring; the question is "what's in this doc," not "what's relevant."
+ * Fetch a representative slice of the user's uploaded chunks. Prefers
+ * chunks from the current session (the doc they probably just dropped),
+ * then falls back to any other doc the same user has uploaded — so
+ * "analyse this doc" reaches the brochure they uploaded in a different
+ * chat. Stride-samples so a 100-chunk doc gives ~8 chunks spread across
+ * the whole document. No vector/lexical scoring; the question is
+ * "what's in this doc," not "what's relevant."
  */
-async function fetchSessionDocChunks(sessionId, { limit = 8 } = {}) {
-  if (!sessionId) return [];
-  const { rows } = await db.pool.query(
-    `SELECT c.id, c.doc_id, c.url, c.chunk_index, c.content, c.metadata
-     FROM ${db.CHUNKS_TABLE} c
-     WHERE c.session_id = $1::uuid
-     ORDER BY c.doc_id, c.chunk_index`,
-    [sessionId],
-  );
-  if (rows.length === 0) return [];
+async function fetchUserDocChunks({ userId, sessionId, limit = 8 } = {}) {
+  if (!userId && !sessionId) return [];
+
+  // Try current session first — most specific signal of "this doc."
+  if (sessionId) {
+    const { rows } = await db.pool.query(
+      `SELECT c.id, c.doc_id, c.url, c.chunk_index, c.content, c.metadata
+       FROM ${db.CHUNKS_TABLE} c
+       WHERE c.session_id = $1::uuid
+       ORDER BY c.doc_id, c.chunk_index`,
+      [sessionId],
+    );
+    if (rows.length > 0) return stride(rows, limit);
+  }
+
+  // Fall back to any of the user's other uploads.
+  if (userId) {
+    const { rows } = await db.pool.query(
+      `SELECT c.id, c.doc_id, c.url, c.chunk_index, c.content, c.metadata
+       FROM ${db.CHUNKS_TABLE} c
+       WHERE c.session_id IN (
+         SELECT session_id FROM ${db.SESSIONS_TABLE} WHERE user_id = $1::text
+       )
+       ORDER BY c.doc_id, c.chunk_index`,
+      [userId],
+    );
+    if (rows.length > 0) return stride(rows, limit);
+  }
+
+  return [];
+}
+
+function stride(rows, limit) {
   if (rows.length <= limit) return rows;
-  // Stride sample to cover the whole document(s).
-  const stride = (rows.length - 1) / (limit - 1);
+  const step = (rows.length - 1) / (limit - 1);
   const out = [];
   for (let i = 0; i < limit; i++) {
-    out.push(rows[Math.round(i * stride)]);
+    out.push(rows[Math.round(i * step)]);
   }
   return out;
 }
@@ -323,9 +348,11 @@ async function* askStream(question, options = {}) {
   // an actual analysis of the document."
   let retrieved;
   let usedMetaDoc = false;
-  if (options.sessionId && looksLikeMetaDocQuery(q)) {
+  if ((options.userId || options.sessionId) && looksLikeMetaDocQuery(q)) {
     const topK = Math.min(20, Math.max(1, options.topK ?? config.retrieval.topK));
-    const docRows = await fetchSessionDocChunks(options.sessionId, {
+    const docRows = await fetchUserDocChunks({
+      userId: options.userId,
+      sessionId: options.sessionId,
       limit: Math.max(8, topK),
     });
     if (docRows.length > 0) {
